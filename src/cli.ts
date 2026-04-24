@@ -665,15 +665,11 @@ async function main(): Promise<void> {
 }
 
 // Only run main when this file is the actual entry point.
-// The equality check covers `tsx src/cli.ts` (tsx sets argv[1] to the real source
-// path) and `node dist/cli.js` (import.meta.url resolves to the dist file).
-// We deliberately DO NOT add a broad '/*.ts' fallback to avoid triggering main()
-// when any importer's argv[1] happens to end with 'cli.ts' (e.g., test files).
-const _isCliMain =
-  process.argv[1] === fileURLToPath(import.meta.url) ||
-  process.argv[1]?.endsWith('/dist/cli.js');
+// Resolve both argv[1] and import.meta.url through realpath so symlinks
+// (created by `npm install -g`) are handled correctly. See entry-guard.ts.
+import { isEntryPoint } from './entry-guard.js';
 
-if (_isCliMain) {
+if (isEntryPoint(process.argv[1], import.meta.url)) {
   main().catch((err) => {
     process.stderr.write(String(err) + '\n');
     process.exit(1);

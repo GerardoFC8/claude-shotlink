@@ -14,7 +14,6 @@
  */
 import { join, basename } from 'node:path';
 import { homedir } from 'node:os';
-import { fileURLToPath } from 'node:url';
 
 import { runHook } from './hook-core.js';
 import type { HookDeps, PidMetaMin } from './hook-core.js';
@@ -165,16 +164,10 @@ async function main(): Promise<void> {
   }
 }
 
-// Only run main when this file is the actual entry point.
-// The equality check covers both `tsx src/hook.ts` (tsx sets argv[1] to the real
-// source path) and compiled `node dist/hook.js` (import.meta.url resolves to the
-// dist file). The endsWith guard is kept only for the compiled binary path.
-// We deliberately DO NOT add a broad '/*.ts' fallback because that would match
-// any importer whose argv[1] happens to end with 'hook.ts' (e.g. test runners).
-const isMain =
-  process.argv[1] === fileURLToPath(import.meta.url) ||
-  process.argv[1]?.endsWith('/dist/hook.js');
+// Resolve both argv[1] and import.meta.url through realpath so symlinks
+// (created by `npm install -g`) are handled correctly. See entry-guard.ts.
+import { isEntryPoint } from './entry-guard.js';
 
-if (isMain) {
+if (isEntryPoint(process.argv[1], import.meta.url)) {
   void main();
 }
