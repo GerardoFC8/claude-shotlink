@@ -1,0 +1,54 @@
+{
+  "name": "@gerardofc/claude-shotlink",
+  "version": "0.1.0",
+  "description": "Auto-upload Claude Code screenshots to a temporary public URL so you can review them from any device via Remote Control.",
+  "license": "MIT",
+  "author": "Gerardo Franco <gerardofranco366@gmail.com>",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "claude-shotlink": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "build": "tsup",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "pnpm build"
+  },
+  "dependencies": {
+    "hono": "^4.6.0",
+    "@hono/node-server": "^1.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsup": "^8.3.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "keywords": [
+    "claude-code",
+    "claude",
+    "playwright",
+    "screenshots",
+    "remote-control",
+    "tunnel",
+    "cloudflare"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GerardoFC8/claude-shotlink.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

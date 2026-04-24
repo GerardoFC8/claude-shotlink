@@ -1,0 +1,8 @@
+{
+  "_version": "2024.12.2",
+  "_note": "sha256 values were computed by downloading each asset from https://github.com/cloudflare/cloudflared/releases/download/2024.12.2/ and running sha256sum locally. Bump this file when CLOUDFLARED_VERSION changes in cloudflared-bin.ts.",
+  "cloudflared-linux-amd64": "5237675a5e806120729acc78c5be02f9db5f406717699587abfa72b49b39fe40",
+  "cloudflared-linux-arm64": "96e8f95e878c1d4154d91c42781749ab66ca8088f1f3e6e6bc78c25c921e6b64",
+  "cloudflared-darwin-amd64.tgz": "71b17468bab0426b20959d4eeadfff3658d07c636beea472539e0781381559cc",
+  "cloudflared-darwin-arm64.tgz": "30eb982ab6dda1e12dbc17b3a9d51c80362874544032930055354965b1930621"
+}
