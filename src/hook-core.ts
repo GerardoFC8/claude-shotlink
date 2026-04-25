@@ -187,8 +187,7 @@ async function doRunHook(
   }
 
   // 8. Build output
-  const additionalContext =
-    'Screenshots:\n' + urls.map((u) => `- ${u}`).join('\n');
+  const additionalContext = composeAdditionalContext(urls);
 
   const output = {
     hookSpecificOutput: {
@@ -201,6 +200,23 @@ async function doRunHook(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Build the imperative additionalContext string sent to Claude.
+ *
+ * The preamble is LOCKED by spec CA-5.1 and SHALL appear verbatim.
+ * The bullet list preserves the "- <url>" format for each URL.
+ *
+ * @param urls - Non-empty array of public screenshot URLs.
+ * @returns The full additionalContext string.
+ */
+export function composeAdditionalContext(urls: string[]): string {
+  const preamble =
+    'The following screenshot URL(s) were just uploaded and are publicly accessible. ' +
+    'You MUST include these exact URL(s) verbatim in your response to the user so they can view the screenshot(s):';
+  const bullets = urls.map((u) => `- ${u}`).join('\n');
+  return `${preamble}\n\n${bullets}`;
+}
 
 function sha256hex(buf: Buffer): string {
   return createHash('sha256').update(buf).digest('hex');

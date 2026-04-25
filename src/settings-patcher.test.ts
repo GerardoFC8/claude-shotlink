@@ -670,6 +670,307 @@ describe('restoreBackup — FIX-2: no temp file remains after successful restore
   });
 });
 
+// ── CA-4: Sentinel-based Hook Idempotency (TASK-007-a / TASK-008-a) ──────────
+//
+// These tests use the NEW sentinel substring 'claude-shotlink/dist/hook.js'
+// and verify the installHook / uninstallHook algorithms handle all B3 scenarios.
+// The sentinel constant is expected to be exported from settings-patcher.ts.
+
+describe('CA-4 — SHOTLINK_HOOK_SENTINEL constant is exported from settings-patcher', () => {
+  it('SHOTLINK_HOOK_SENTINEL equals the expected substring literal', async () => {
+    const mod = await import('./settings-patcher.js');
+    // This will fail until the constant is exported from settings-patcher.ts
+    expect((mod as Record<string, unknown>)['SHOTLINK_HOOK_SENTINEL']).toBe('claude-shotlink/dist/hook.js');
+  });
+});
+
+const NEW_SENTINEL = 'claude-shotlink/dist/hook.js';
+
+// Simulate a v0.2 full-path entry: any path ending with claude-shotlink/dist/hook.js
+const V2_DEV_CMD = 'node "/home/user/projects/claude-shotlink/dist/hook.js"';
+const V2_NPM_GLOBAL_CMD = 'node "/home/user/.npm-global/lib/node_modules/@gerardofc/claude-shotlink/dist/hook.js"';
+const CANONICAL_CMD = 'node "/home/runner/.npm-global/lib/node_modules/@gerardofc/claude-shotlink/dist/hook.js"';
+const UNRELATED_CMD = 'node "/home/user/atuin/hook.js"';
+const SENTINEL_MATCHER = 'Bash|Write';
+
+describe('CA-4 — installHook: fresh install with substring sentinel', () => {
+  let dir: string;
+  let settingsPath: string;
+
+  beforeEach(() => {
+    ({ dir, settingsPath } = makeSettingsDir());
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('fresh install: exactly one PostToolUse entry matching the sentinel after install', async () => {
+    const { installHook } = await import('./settings-patcher.js');
+
+    writeFileSync(settingsPath, '{}', { mode: 0o600 });
+
+    const result = await installHook({
+      settingsPath,
+      hookCommand: CANONICAL_CMD,
+      matcher: SENTINEL_MATCHER,
+      sentinel: NEW_SENTINEL,
+      now: () => new Date('2026-04-25T12:00:00.000Z'),
+    });
+
+    expect(result.action).toBe('installed');
+
+    const parsed = readSettings(settingsPath) as {
+      hooks: { PostToolUse: Array<{ hooks: Array<{ command: string }> }> };
+    };
+    const sentinelGroups = parsed.hooks.PostToolUse.filter((g) =>
+      g.hooks.some((h) => h.command.includes(NEW_SENTINEL))
+    );
+    expect(sentinelGroups).toHaveLength(1);
+    expect(sentinelGroups[0]!.hooks[0]!.command).toBe(CANONICAL_CMD);
+  });
+});
+
+describe('CA-4 — installHook: dev+npm-global duplicate entries collapsed to one', () => {
+  let dir: string;
+  let settingsPath: string;
+
+  beforeEach(() => {
+    ({ dir, settingsPath } = makeSettingsDir());
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('collapses two existing entries (dev path + npm-global path) to one canonical entry', async () => {
+    const { installHook } = await import('./settings-patcher.js');
+
+    // Pre-populate settings with TWO duplicate entries from different install paths
+    const initialSettings = JSON.stringify({
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: SENTINEL_MATCHER,
+            hooks: [{ type: 'command', command: V2_DEV_CMD, timeout: 30 }],
+          },
+          {
+            matcher: SENTINEL_MATCHER,
+            hooks: [{ type: 'command', command: V2_NPM_GLOBAL_CMD, timeout: 30 }],
+          },
+        ],
+      },
+    }, null, 2);
+    writeFileSync(settingsPath, initialSettings, { mode: 0o600 });
+
+    const result = await installHook({
+      settingsPath,
+      hookCommand: CANONICAL_CMD,
+      matcher: SENTINEL_MATCHER,
+      sentinel: NEW_SENTINEL,
+      now: () => new Date('2026-04-25T12:00:00.000Z'),
+    });
+
+    expect(result.action).toBe('installed');
+
+    const parsed = readSettings(settingsPath) as {
+      hooks: { PostToolUse: Array<{ hooks: Array<{ command: string }> }> };
+    };
+    // Exactly ONE sentinel-matching entry must remain
+    const sentinelGroups = parsed.hooks.PostToolUse.filter((g) =>
+      g.hooks.some((h) => h.command.includes(NEW_SENTINEL))
+    );
+    expect(sentinelGroups).toHaveLength(1);
+    expect(sentinelGroups[0]!.hooks[0]!.command).toBe(CANONICAL_CMD);
+    // Total groups = 1 (only the canonical; both duplicates removed)
+    expect(parsed.hooks.PostToolUse).toHaveLength(1);
+  });
+});
+
+describe('CA-4 — installHook: v0.2 full-path entry auto-migrated by substring match', () => {
+  let dir: string;
+  let settingsPath: string;
+
+  beforeEach(() => {
+    ({ dir, settingsPath } = makeSettingsDir());
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('v0.2 full-path entry is evicted and replaced by canonical entry', async () => {
+    const { installHook } = await import('./settings-patcher.js');
+
+    // v0.2-style entry: full path that ends with claude-shotlink/dist/hook.js
+    const v2Settings = JSON.stringify({
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: SENTINEL_MATCHER,
+            hooks: [{ type: 'command', command: V2_NPM_GLOBAL_CMD, timeout: 30 }],
+          },
+        ],
+      },
+    }, null, 2);
+    writeFileSync(settingsPath, v2Settings, { mode: 0o600 });
+
+    const result = await installHook({
+      settingsPath,
+      hookCommand: CANONICAL_CMD,
+      matcher: SENTINEL_MATCHER,
+      sentinel: NEW_SENTINEL,
+      now: () => new Date('2026-04-25T12:00:00.000Z'),
+    });
+
+    expect(result.action).toBe('installed');
+
+    const parsed = readSettings(settingsPath) as {
+      hooks: { PostToolUse: Array<{ hooks: Array<{ command: string }> }> };
+    };
+    // Only the canonical entry must remain
+    expect(parsed.hooks.PostToolUse).toHaveLength(1);
+    expect(parsed.hooks.PostToolUse[0]!.hooks[0]!.command).toBe(CANONICAL_CMD);
+    // Old v0.2 command must be gone
+    const allCmds = parsed.hooks.PostToolUse.flatMap((g) => g.hooks.map((h) => h.command));
+    expect(allCmds).not.toContain(V2_NPM_GLOBAL_CMD);
+  });
+});
+
+describe('CA-4 — installHook: unrelated hooks are untouched', () => {
+  let dir: string;
+  let settingsPath: string;
+
+  beforeEach(() => {
+    ({ dir, settingsPath } = makeSettingsDir());
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('unrelated PostToolUse hook (atuin) remains byte-identical after install', async () => {
+    const { installHook } = await import('./settings-patcher.js');
+
+    const initialSettings = JSON.stringify({
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: 'Bash',
+            hooks: [{ type: 'command', command: UNRELATED_CMD, timeout: 60 }],
+          },
+        ],
+      },
+    }, null, 2);
+    writeFileSync(settingsPath, initialSettings, { mode: 0o600 });
+
+    await installHook({
+      settingsPath,
+      hookCommand: CANONICAL_CMD,
+      matcher: SENTINEL_MATCHER,
+      sentinel: NEW_SENTINEL,
+      now: () => new Date('2026-04-25T12:00:00.000Z'),
+    });
+
+    const parsed = readSettings(settingsPath) as {
+      hooks: { PostToolUse: Array<{ hooks: Array<{ command: string }> }> };
+    };
+    // Two groups: unrelated + our canonical
+    expect(parsed.hooks.PostToolUse).toHaveLength(2);
+    // The unrelated hook must still be present and unmodified
+    const unrelatedGroup = parsed.hooks.PostToolUse.find((g) =>
+      g.hooks.some((h) => h.command === UNRELATED_CMD)
+    );
+    expect(unrelatedGroup).toBeDefined();
+  });
+});
+
+describe('CA-4 — uninstallHook: removes all sentinel-matching entries', () => {
+  let dir: string;
+  let settingsPath: string;
+
+  beforeEach(() => {
+    ({ dir, settingsPath } = makeSettingsDir());
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('removes both legacy and new entries matching the sentinel in one pass', async () => {
+    const { uninstallHook } = await import('./settings-patcher.js');
+
+    // Two duplicate entries: one dev, one npm-global
+    const initialSettings = JSON.stringify({
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: SENTINEL_MATCHER,
+            hooks: [{ type: 'command', command: V2_DEV_CMD, timeout: 30 }],
+          },
+          {
+            matcher: 'Bash',
+            hooks: [{ type: 'command', command: UNRELATED_CMD, timeout: 60 }],
+          },
+          {
+            matcher: SENTINEL_MATCHER,
+            hooks: [{ type: 'command', command: V2_NPM_GLOBAL_CMD, timeout: 30 }],
+          },
+        ],
+      },
+    }, null, 2);
+    writeFileSync(settingsPath, initialSettings, { mode: 0o600 });
+
+    const result = await uninstallHook({
+      settingsPath,
+      sentinel: NEW_SENTINEL,
+      now: () => new Date('2026-04-25T12:00:00.000Z'),
+    });
+
+    expect(result.action).toBe('removed');
+    expect(result.removedCount).toBe(2);
+
+    const parsed = readSettings(settingsPath) as {
+      hooks: { PostToolUse: Array<{ hooks: Array<{ command: string }> }> };
+    };
+    // Only the unrelated hook remains
+    expect(parsed.hooks.PostToolUse).toHaveLength(1);
+    expect(parsed.hooks.PostToolUse[0]!.hooks[0]!.command).toBe(UNRELATED_CMD);
+
+    // No sentinel-matching entry remains
+    const sentinelGroups = parsed.hooks.PostToolUse.filter((g) =>
+      g.hooks.some((h) => h.command.includes(NEW_SENTINEL))
+    );
+    expect(sentinelGroups).toHaveLength(0);
+  });
+
+  it('uninstall on clean settings.json with no sentinel entries is a no-op (not-present)', async () => {
+    const { uninstallHook } = await import('./settings-patcher.js');
+
+    const initialSettings = JSON.stringify({
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: 'Bash',
+            hooks: [{ type: 'command', command: UNRELATED_CMD, timeout: 60 }],
+          },
+        ],
+      },
+    }, null, 2);
+    writeFileSync(settingsPath, initialSettings, { mode: 0o600 });
+
+    const result = await uninstallHook({
+      settingsPath,
+      sentinel: NEW_SENTINEL,
+      now: () => new Date('2026-04-25T12:00:00.000Z'),
+    });
+
+    expect(result.action).toBe('not-present');
+    expect(result.removedCount).toBe(0);
+    expect(result.backupPath).toBeNull();
+  });
+});
+
 // ── Helper fn ─────────────────────────────────────────────────────────────────
 
 function result_backupPath(filename: string | undefined, dir: string): string | null {

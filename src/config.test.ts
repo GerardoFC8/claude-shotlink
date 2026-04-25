@@ -180,6 +180,171 @@ describe('loadConfigFrom — CA-1: edge cases (ENOENT, invalid JSON, invalid sha
   });
 });
 
+// ── TASK-001-a / TASK-002-a: CA-2 — tunnelCredentialsFile + tunnelLocalPort ──
+
+describe('validateConfigShape — CA-2.1: new optional fields accepted', () => {
+  it('accepts config with both tunnelCredentialsFile and tunnelLocalPort (CA-2 scenario 1)', async () => {
+    const dir = await makeTempDir();
+    try {
+      const p = await writeCfg(dir, {
+        apiKey: 'sk_abc',
+        createdAt: '2026-01-01T00:00:00Z',
+        tunnelCredentialsFile: '/home/user/.cloudflared/abc.json',
+        tunnelLocalPort: 7331,
+      });
+      const { loadConfigFrom } = await import('./config.js');
+      const cfg = await loadConfigFrom(p);
+      expect(cfg.tunnelCredentialsFile).toBe('/home/user/.cloudflared/abc.json');
+      expect(cfg.tunnelLocalPort).toBe(7331);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts v0.2 config without new fields (backward compat — CA-2 scenario 2)', async () => {
+    const dir = await makeTempDir();
+    try {
+      const p = await writeCfg(dir, {
+        apiKey: 'sk_abc',
+        createdAt: '2026-01-01T00:00:00Z',
+        tunnelMode: 'named',
+        tunnelName: 'x',
+        tunnelHostname: 'shots.example.com',
+      });
+      const { loadConfigFrom } = await import('./config.js');
+      const cfg = await loadConfigFrom(p);
+      expect(cfg.tunnelCredentialsFile).toBeUndefined();
+      expect(cfg.tunnelLocalPort).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects config with unknown extra key tunnelFoo (strict-closed contract — CA-2 scenario 3)', async () => {
+    const dir = await makeTempDir();
+    try {
+      const p = await writeCfg(dir, {
+        apiKey: 'sk_abc',
+        createdAt: '2026-01-01T00:00:00Z',
+        tunnelFoo: 'bar',
+      });
+      const { loadConfigFrom } = await import('./config.js');
+      await expect(loadConfigFrom(p)).rejects.toThrow(/tunnelFoo/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('tunnelCredentialsFile and tunnelLocalPort are in ALLOWED_KEYS (CA-2 scenario 4 — both fields accepted, no unknown-key rejection)', async () => {
+    const dir = await makeTempDir();
+    try {
+      const p = await writeCfg(dir, {
+        apiKey: 'sk_abc',
+        createdAt: '2026-01-01T00:00:00Z',
+        tunnelCredentialsFile: '/home/user/.cloudflared/abc.json',
+        tunnelLocalPort: 7331,
+      });
+      const { loadConfigFrom } = await import('./config.js');
+      // If ALLOWED_KEYS is missing either key, this will throw "Unknown field in config"
+      await expect(loadConfigFrom(p)).resolves.toBeDefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('validateConfigShape — CA-2.1: field-level validation', () => {
+  it('rejects empty tunnelCredentialsFile string', async () => {
+    const dir = await makeTempDir();
+    try {
+      const p = await writeCfg(dir, {
+        apiKey: 'sk_abc',
+        createdAt: '2026-01-01T00:00:00Z',
+        tunnelCredentialsFile: '',
+      });
+      const { loadConfigFrom } = await import('./config.js');
+      await expect(loadConfigFrom(p)).rejects.toThrow(/tunnelCredentialsFile/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects relative tunnelCredentialsFile path (must be absolute)', async () => {
+    const dir = await makeTempDir();
+    try {
+      const p = await writeCfg(dir, {
+        apiKey: 'sk_abc',
+        createdAt: '2026-01-01T00:00:00Z',
+        tunnelCredentialsFile: '.cloudflared/abc.json',
+      });
+      const { loadConfigFrom } = await import('./config.js');
+      await expect(loadConfigFrom(p)).rejects.toThrow(/tunnelCredentialsFile/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects tunnelLocalPort of 0 (out of range)', async () => {
+    const dir = await makeTempDir();
+    try {
+      const p = await writeCfg(dir, {
+        apiKey: 'sk_abc',
+        createdAt: '2026-01-01T00:00:00Z',
+        tunnelLocalPort: 0,
+      });
+      const { loadConfigFrom } = await import('./config.js');
+      await expect(loadConfigFrom(p)).rejects.toThrow(/tunnelLocalPort/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects tunnelLocalPort of 65536 (out of range)', async () => {
+    const dir = await makeTempDir();
+    try {
+      const p = await writeCfg(dir, {
+        apiKey: 'sk_abc',
+        createdAt: '2026-01-01T00:00:00Z',
+        tunnelLocalPort: 65536,
+      });
+      const { loadConfigFrom } = await import('./config.js');
+      await expect(loadConfigFrom(p)).rejects.toThrow(/tunnelLocalPort/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects tunnelLocalPort that is a float (must be integer)', async () => {
+    const dir = await makeTempDir();
+    try {
+      const p = await writeCfg(dir, {
+        apiKey: 'sk_abc',
+        createdAt: '2026-01-01T00:00:00Z',
+        tunnelLocalPort: 7331.5,
+      });
+      const { loadConfigFrom } = await import('./config.js');
+      await expect(loadConfigFrom(p)).rejects.toThrow(/tunnelLocalPort/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects tunnelLocalPort that is a string', async () => {
+    const dir = await makeTempDir();
+    try {
+      const p = await writeCfg(dir, {
+        apiKey: 'sk_abc',
+        createdAt: '2026-01-01T00:00:00Z',
+        tunnelLocalPort: '7331',
+      });
+      const { loadConfigFrom } = await import('./config.js');
+      await expect(loadConfigFrom(p)).rejects.toThrow(/tunnelLocalPort/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 // ── TASK-004-a: saveConfig atomic write + round-trip ─────────────────────────
 
 describe('saveConfig — CA-1: atomic write, round-trip, undefined fields dropped', () => {
@@ -245,6 +410,110 @@ describe('saveConfig — CA-1: atomic write, round-trip, undefined fields droppe
       const st = await stat(configPath);
       // mode 0o600 = rw------- → last 9 bits: 0o100600
       expect(st.mode & 0o777).toBe(0o600);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── FIX-1: Co-constraint on credentials/port pairing ─────────────────────────
+
+describe('validateConfigShape — FIX-1: tunnelCredentialsFile + tunnelLocalPort co-constraint', () => {
+  it('FIX-1 RED: tunnelMode=named + only tunnelCredentialsFile (no tunnelLocalPort) → throws', async () => {
+    const dir = await makeTempDir();
+    try {
+      const p = await writeCfg(dir, {
+        apiKey: 'sk_abc',
+        createdAt: '2026-01-01T00:00:00Z',
+        tunnelMode: 'named',
+        tunnelName: 'my-tunnel',
+        tunnelHostname: 'shots.example.com',
+        tunnelCredentialsFile: '/home/user/.cloudflared/abc.json',
+        // tunnelLocalPort intentionally absent
+      });
+      const { loadConfigFrom } = await import('./config.js');
+      await expect(loadConfigFrom(p)).rejects.toThrow(
+        /tunnelCredentialsFile and tunnelLocalPort must be both set together/,
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('FIX-1 RED: tunnelMode=named + only tunnelLocalPort (no tunnelCredentialsFile) → throws', async () => {
+    const dir = await makeTempDir();
+    try {
+      const p = await writeCfg(dir, {
+        apiKey: 'sk_abc',
+        createdAt: '2026-01-01T00:00:00Z',
+        tunnelMode: 'named',
+        tunnelName: 'my-tunnel',
+        tunnelHostname: 'shots.example.com',
+        tunnelLocalPort: 7331,
+        // tunnelCredentialsFile intentionally absent
+      });
+      const { loadConfigFrom } = await import('./config.js');
+      await expect(loadConfigFrom(p)).rejects.toThrow(
+        /tunnelCredentialsFile and tunnelLocalPort must be both set together/,
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('FIX-1 GREEN: tunnelMode=named + BOTH tunnelCredentialsFile and tunnelLocalPort → loads OK', async () => {
+    const dir = await makeTempDir();
+    try {
+      const p = await writeCfg(dir, {
+        apiKey: 'sk_abc',
+        createdAt: '2026-01-01T00:00:00Z',
+        tunnelMode: 'named',
+        tunnelName: 'my-tunnel',
+        tunnelHostname: 'shots.example.com',
+        tunnelCredentialsFile: '/home/user/.cloudflared/abc.json',
+        tunnelLocalPort: 7331,
+      });
+      const { loadConfigFrom } = await import('./config.js');
+      const cfg = await loadConfigFrom(p);
+      expect(cfg.tunnelCredentialsFile).toBe('/home/user/.cloudflared/abc.json');
+      expect(cfg.tunnelLocalPort).toBe(7331);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('FIX-1 GREEN: tunnelMode=named + NEITHER field (legacy path) → loads OK', async () => {
+    const dir = await makeTempDir();
+    try {
+      const p = await writeCfg(dir, {
+        apiKey: 'sk_abc',
+        createdAt: '2026-01-01T00:00:00Z',
+        tunnelMode: 'named',
+        tunnelName: 'my-tunnel',
+        tunnelHostname: 'shots.example.com',
+        // neither tunnelCredentialsFile nor tunnelLocalPort
+      });
+      const { loadConfigFrom } = await import('./config.js');
+      const cfg = await loadConfigFrom(p);
+      expect(cfg.tunnelCredentialsFile).toBeUndefined();
+      expect(cfg.tunnelLocalPort).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('FIX-1 GREEN: tunnelMode absent + both fields present → loads OK (not in named mode, no constraint)', async () => {
+    const dir = await makeTempDir();
+    try {
+      const p = await writeCfg(dir, {
+        apiKey: 'sk_abc',
+        createdAt: '2026-01-01T00:00:00Z',
+        tunnelCredentialsFile: '/home/user/.cloudflared/abc.json',
+        tunnelLocalPort: 7331,
+      });
+      const { loadConfigFrom } = await import('./config.js');
+      const cfg = await loadConfigFrom(p);
+      expect(cfg.tunnelCredentialsFile).toBe('/home/user/.cloudflared/abc.json');
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

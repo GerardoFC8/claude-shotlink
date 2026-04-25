@@ -40,6 +40,23 @@ export interface Config {
    * tunnel. Validated as a host-shaped string (no scheme, no path).
    */
   tunnelHostname?: string;
+
+  // ── v0.3 additions (all optional, additive) ──────────────────────────────
+
+  /**
+   * Absolute path to cloudflared credentials JSON file (UUID-keyed).
+   * Written by `setup-tunnel`; absence preserves v0.2 spawn behavior
+   * (cloudflared reads ~/.cloudflared/config.yml).
+   * Must be an absolute path starting with '/'.
+   */
+  tunnelCredentialsFile?: string;
+
+  /**
+   * Local port the named tunnel proxies to. Used as the default port when
+   * `start` is run without --port. Must be an integer in [1, 65535].
+   * Default 7331.
+   */
+  tunnelLocalPort?: number;
 }
 
 export const CONFIG_DIR = join(homedir(), '.claude-shotlink');
@@ -52,6 +69,8 @@ const ALLOWED_KEYS = new Set<string>([
   'tunnelMode',
   'tunnelName',
   'tunnelHostname',
+  'tunnelCredentialsFile',
+  'tunnelLocalPort',
 ]);
 
 /**
@@ -102,6 +121,37 @@ function validateConfigShape(parsed: unknown): asserts parsed is Config {
     if (!HOSTNAME_RE.test(v['tunnelHostname'])) {
       throw new Error(
         `Config field tunnelHostname has invalid shape: "${v['tunnelHostname']}" — expected a bare hostname (no scheme, no path).`,
+      );
+    }
+  }
+
+  // v0.3 optional fields
+  if ('tunnelCredentialsFile' in v) {
+    if (typeof v['tunnelCredentialsFile'] !== 'string' || v['tunnelCredentialsFile'] === '') {
+      throw new Error('Config field tunnelCredentialsFile must be a non-empty string.');
+    }
+    if (!v['tunnelCredentialsFile'].startsWith('/')) {
+      throw new Error('Config field tunnelCredentialsFile must be an absolute path.');
+    }
+  }
+  if ('tunnelLocalPort' in v) {
+    const p = v['tunnelLocalPort'];
+    if (typeof p !== 'number' || !Number.isInteger(p) || p < 1 || p > 65535) {
+      throw new Error('Config field tunnelLocalPort must be an integer between 1 and 65535.');
+    }
+  }
+
+  // FIX-1: Co-constraint — when tunnelMode is 'named', tunnelCredentialsFile and
+  // tunnelLocalPort must BOTH be set or BOTH be absent.  A partial pair means the
+  // config was hand-edited incorrectly and the spawn path would silently fall back
+  // to a different (legacy) code path, hiding the misconfiguration.
+  if (v['tunnelMode'] === 'named') {
+    const hasCredsFile = 'tunnelCredentialsFile' in v;
+    const hasLocalPort = 'tunnelLocalPort' in v;
+    if (hasCredsFile !== hasLocalPort) {
+      throw new Error(
+        'tunnelCredentialsFile and tunnelLocalPort must be both set together when tunnelMode is \'named\' and credentials-file mode is used. ' +
+        'Set both, or remove both to use legacy ~/.cloudflared/config.yml.',
       );
     }
   }

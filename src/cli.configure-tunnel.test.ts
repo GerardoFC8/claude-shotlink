@@ -54,6 +54,12 @@ function buildFakeDeps(overrides: Record<string, any> = {}): CliDeps {
     updatePidFileUrl: vi.fn().mockResolvedValue(undefined),
     purgeDedupCache: vi.fn().mockResolvedValue(undefined),
     startHealthcheck: vi.fn().mockReturnValue({ stop: vi.fn(), failCount: 0, stopped: false }),
+    setupTunnel: vi.fn().mockResolvedValue({
+      ok: true,
+      uuid: 'test-uuid',
+      credentialsFile: '/fake/creds.json',
+      dnsRouted: true,
+    }),
   };
 
   return { ...defaults, ...overrides } as unknown as CliDeps;

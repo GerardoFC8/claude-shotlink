@@ -290,6 +290,98 @@ describe('hook: realUploadFn uses basename for upload filename', () => {
   });
 });
 
+// ── CA-5: Imperative additionalContext phrasing ───────────────────────────────
+
+const LOCKED_PREAMBLE =
+  'The following screenshot URL(s) were just uploaded and are publicly accessible. ' +
+  'You MUST include these exact URL(s) verbatim in your response to the user so they can view the screenshot(s):';
+
+describe('hook-core: CA-5 — imperative additionalContext phrasing (single URL)', () => {
+  it('additionalContext begins with the exact locked preamble for a single uploaded URL', async () => {
+    const { runHook } = await import('./hook-core.js');
+
+    const url = 'https://shots.x/f/abc';
+    const deps = makeDeps({
+      uploadFn: vi.fn().mockResolvedValue({ id: 'abc', url }),
+    });
+
+    const fakePngBuf = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const result = await runHook(
+      makeWritePayload('/tmp/screenshots/shot.png'),
+      deps,
+      { fileExists: () => true, readFileFn: vi.fn().mockResolvedValue(fakePngBuf) },
+    );
+
+    expect(result.stdout).toBeDefined();
+    const parsed = JSON.parse(result.stdout!);
+    const ac: string = parsed.hookSpecificOutput.additionalContext;
+
+    expect(ac).toContain(LOCKED_PREAMBLE);
+    expect(ac).toContain(`- ${url}`);
+  });
+});
+
+describe('hook-core: CA-5 — imperative additionalContext phrasing (multi URL)', () => {
+  it('additionalContext begins with the exact locked preamble for multiple uploaded URLs', async () => {
+    const { runHook } = await import('./hook-core.js');
+
+    const url1 = 'https://shots.x/f/aaa';
+    const url2 = 'https://shots.x/f/bbb';
+    const url3 = 'https://shots.x/f/ccc';
+
+    let callCount = 0;
+    const urls = [url1, url2, url3];
+    const deps = makeDeps({
+      uploadFn: vi.fn().mockImplementation(async () => ({ id: 'x', url: urls[callCount++]! })),
+      dedupCache: {
+        load: vi.fn().mockResolvedValue(undefined),
+        lookup: vi.fn().mockReturnValue(null),
+        remember: vi.fn(),
+        flush: vi.fn().mockResolvedValue(undefined),
+      },
+      fs: {
+        walk: vi.fn().mockResolvedValue([
+          { absPath: '/tmp/screenshots/a.png', source: 'bash-scan' as const, mtimeMs: Date.now() },
+          { absPath: '/tmp/screenshots/b.png', source: 'bash-scan' as const, mtimeMs: Date.now() },
+          { absPath: '/tmp/screenshots/c.png', source: 'bash-scan' as const, mtimeMs: Date.now() },
+        ]),
+      },
+    });
+
+    const fakePngBuf = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const result = await runHook(
+      makeBashPayload('npx playwright test'),
+      deps,
+      { fileExists: () => true, readFileFn: vi.fn().mockResolvedValue(fakePngBuf) },
+    );
+
+    expect(result.stdout).toBeDefined();
+    const parsed = JSON.parse(result.stdout!);
+    const ac: string = parsed.hookSpecificOutput.additionalContext;
+
+    expect(ac).toContain(LOCKED_PREAMBLE);
+    expect(ac).toContain(`- ${url1}`);
+    expect(ac).toContain(`- ${url2}`);
+    expect(ac).toContain(`- ${url3}`);
+  });
+});
+
+describe('hook-core: CA-5 — zero screenshots — preamble NOT emitted', () => {
+  it('returns no stdout (no additionalContext) when no screenshots are detected', async () => {
+    const { runHook } = await import('./hook-core.js');
+
+    const deps = makeDeps({
+      fs: { walk: vi.fn().mockResolvedValue([]) },
+    });
+
+    // A Bash payload that does NOT produce any candidates (walk returns [])
+    const result = await runHook(makeBashPayload('echo hello'), deps);
+
+    // No screenshots → no output at all
+    expect(result.stdout).toBeUndefined();
+  });
+});
+
 // ── SUSPECT-2 regression: uploadFn receives the already-read buffer ───────────
 
 describe('hook-core: uploadFn receives same buffer as sha256', () => {

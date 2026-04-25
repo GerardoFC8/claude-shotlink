@@ -37,7 +37,23 @@ const DEFAULT_NAMED_READY_GRACE_MS = 2_000;
 
 export type TunnelMode =
   | { mode: 'quick' }
-  | { mode: 'named'; name: string; hostname: string };
+  | {
+      mode: 'named';
+      name: string;
+      hostname: string;
+      /**
+       * v0.3: Absolute path to the cloudflared credentials JSON file.
+       * When present (together with localPort), the tunnel spawns with
+       * --credentials-file + --url args, bypassing ~/.cloudflared/config.yml.
+       * When absent, the v0.2 legacy spawn args are used.
+       */
+      credentialsFile?: string;
+      /**
+       * v0.3: Local port that cloudflared proxies to when credentialsFile is set.
+       * Used to build --url http://127.0.0.1:<localPort>.
+       */
+      localPort?: number;
+    };
 
 export type TunnelState = 'starting' | 'up' | 'reconnecting' | 'stopped';
 
@@ -92,7 +108,13 @@ export function createTunnel(opts: TunnelOptions): Promise<Tunnel> {
   if (isNamedMode) {
     return createNamedTunnel({
       binaryPath,
-      tunnel: tunnel as { mode: 'named'; name: string; hostname: string },
+      tunnel: tunnel as {
+        mode: 'named';
+        name: string;
+        hostname: string;
+        credentialsFile?: string;
+        localPort?: number;
+      },
       urlTimeoutMs,
       defaultGrace,
       namedReadyGraceMs,
@@ -274,11 +296,51 @@ function createQuickTunnel(opts: QuickTunnelInternalOpts): Promise<Tunnel> {
   });
 }
 
+// ── Named-mode spawn arg builder (CA-3) ──────────────────────────────────────
+
+/**
+ * Build the cloudflared args for named-tunnel mode.
+ *
+ * v0.3 inline-args path: when both `credentialsFile` AND `localPort` are
+ * present, spawn with --credentials-file + --url, bypassing config.yml.
+ *
+ * v0.2 legacy path: when either field is absent, use the original 4-arg form
+ * so that existing users with ~/.cloudflared/config.yml are unaffected.
+ *
+ * NOTE: --no-autoupdate is a TUNNEL-level option (must precede `run`).
+ * Both paths preserve this ordering.
+ */
+function buildNamedSpawnArgs(t: {
+  name: string;
+  credentialsFile?: string;
+  localPort?: number;
+}): string[] {
+  if (t.credentialsFile !== undefined && t.localPort !== undefined) {
+    // v0.3 inline-args path — bypasses ~/.cloudflared/config.yml
+    return [
+      'tunnel',
+      '--no-autoupdate',
+      'run',
+      '--credentials-file', t.credentialsFile,
+      '--url', `http://127.0.0.1:${t.localPort}`,
+      t.name,
+    ];
+  }
+  // v0.2 legacy path — cloudflared reads ~/.cloudflared/config.yml
+  return ['tunnel', '--no-autoupdate', 'run', t.name];
+}
+
 // ── Named-mode implementation (v0.2 new) ─────────────────────────────────────
 
 interface NamedTunnelInternalOpts {
   binaryPath: string;
-  tunnel: { mode: 'named'; name: string; hostname: string };
+  tunnel: {
+    mode: 'named';
+    name: string;
+    hostname: string;
+    credentialsFile?: string;
+    localPort?: number;
+  };
   urlTimeoutMs: number;
   defaultGrace: number;
   namedReadyGraceMs: number;
@@ -289,20 +351,15 @@ interface NamedTunnelInternalOpts {
 function createNamedTunnel(opts: NamedTunnelInternalOpts): Promise<Tunnel> {
   const { binaryPath, tunnel, urlTimeoutMs, defaultGrace, namedReadyGraceMs, onExit, spawnFn } =
     opts;
-  const { name, hostname } = tunnel;
+  const { name, hostname, credentialsFile, localPort } = tunnel;
   const publicBaseUrl = `https://${hostname}`;
 
   return new Promise<Tunnel>((resolve, reject) => {
-    // NOTE: cloudflared 2024.12.x parses `--no-autoupdate` as a TUNNEL
-    // command option, not a `run` subcommand option. It MUST come before `run`.
-    // Wrong order → "Incorrect Usage: flag provided but not defined: -no-autoupdate"
-    // and cloudflared exits 0 (printing help), which trips our early-exit reject.
-    const args = [
-      'tunnel',
-      '--no-autoupdate',
-      'run',
-      name,
-    ];
+    // Build spawn args based on whether credentials-file is available.
+    // v0.3: --credentials-file + --url path bypasses ~/.cloudflared/config.yml.
+    // v0.2 legacy: plain `run <name>` (cloudflared reads config.yml).
+    // NOTE: --no-autoupdate is a TUNNEL-level option (must precede `run`).
+    const args = buildNamedSpawnArgs({ name, credentialsFile, localPort });
 
     const child = spawnFn(binaryPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 

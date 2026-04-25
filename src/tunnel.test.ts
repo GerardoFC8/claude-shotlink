@@ -800,3 +800,166 @@ describe('createTunnel — FIX-4: named-mode onDrop not called on intentional st
     expect(dropCount).toBe(1);
   });
 });
+
+// ── B2: TASK-003-a RED — new credentials-file spawn path ─────────────────────
+
+describe('createTunnel — CA-3: new spawn path with --credentials-file and --url', () => {
+  it('TASK-003-a: spawns with --credentials-file and --url when credentialsFile + localPort present', async () => {
+    const { createTunnel } = await import('./tunnel.js');
+
+    const child = makeFakeChild();
+    const spawnImpl = vi.fn().mockReturnValue(child);
+
+    const p = createTunnel({
+      localPort: 18080,
+      binaryPath: '/usr/local/bin/cloudflared',
+      urlTimeoutMs: 10_000,
+      namedReadyGraceMs: 5_000,
+      spawnImpl,
+      tunnel: {
+        mode: 'named',
+        name: 'shotlink',
+        hostname: 'shots.x.com',
+        credentialsFile: '/path/to/uuid.json',
+        localPort: 18080,
+      },
+    });
+
+    expect(spawnImpl).toHaveBeenCalledWith(
+      '/usr/local/bin/cloudflared',
+      [
+        'tunnel',
+        '--no-autoupdate',
+        'run',
+        '--credentials-file', '/path/to/uuid.json',
+        '--url', 'http://127.0.0.1:18080',
+        'shotlink',
+      ],
+      expect.objectContaining({ stdio: ['ignore', 'pipe', 'pipe'] }),
+    );
+
+    // Clean up
+    await new Promise<void>((r) => setTimeout(r, 10));
+    child._exitWithCode(0);
+    await p.catch(() => {});
+  });
+
+  it('TASK-003-a: resolves with public URL after ready signal in new spawn path', async () => {
+    const { createTunnel } = await import('./tunnel.js');
+
+    const child = makeFakeChild();
+    const spawnImpl = vi.fn().mockReturnValue(child);
+
+    const p = createTunnel({
+      localPort: 7331,
+      binaryPath: '/fake/cloudflared',
+      urlTimeoutMs: 10_000,
+      namedReadyGraceMs: 5_000,
+      spawnImpl,
+      tunnel: {
+        mode: 'named',
+        name: 'myname',
+        hostname: 'shots.example.com',
+        credentialsFile: '/home/user/.cloudflared/abc.json',
+        localPort: 7331,
+      },
+    });
+
+    await new Promise<void>((r) => setTimeout(r, 20));
+    child.stderr.push('Registered tunnel connection connID=abc\n');
+
+    const tunnel = await p;
+    expect(tunnel.publicUrl).toBe('https://shots.example.com');
+  });
+
+  it('TASK-003-a: rejects when child exits before ready in new spawn path', async () => {
+    const { createTunnel } = await import('./tunnel.js');
+
+    const child = makeFakeChild();
+    const spawnImpl = vi.fn().mockReturnValue(child);
+
+    const p = createTunnel({
+      localPort: 7331,
+      binaryPath: '/fake/cloudflared',
+      urlTimeoutMs: 10_000,
+      namedReadyGraceMs: 5_000,
+      spawnImpl,
+      tunnel: {
+        mode: 'named',
+        name: 'myname',
+        hostname: 'shots.example.com',
+        credentialsFile: '/home/user/.cloudflared/abc.json',
+        localPort: 7331,
+      },
+    });
+
+    await new Promise<void>((r) => setTimeout(r, 10));
+    child._exitWithCode(1);
+
+    await expect(p).rejects.toThrow(/cloudflared exited/i);
+  });
+});
+
+// ── B2: TASK-004-a RED — legacy spawn path regression check ─────────────────
+
+describe('createTunnel — CA-3: legacy spawn path unchanged (no credentialsFile)', () => {
+  it('TASK-004-a: spawns with legacy args ["tunnel","--no-autoupdate","run",name] when credentialsFile absent', async () => {
+    const { createTunnel } = await import('./tunnel.js');
+
+    const child = makeFakeChild();
+    const spawnImpl = vi.fn().mockReturnValue(child);
+
+    const p = createTunnel({
+      localPort: 3000,
+      binaryPath: '/fake/cloudflared',
+      urlTimeoutMs: 5000,
+      spawnImpl,
+      tunnel: { mode: 'named', name: 'shotlink', hostname: 'shots.x.com' },
+    });
+
+    expect(spawnImpl).toHaveBeenCalledWith(
+      '/fake/cloudflared',
+      ['tunnel', '--no-autoupdate', 'run', 'shotlink'],
+      expect.objectContaining({ stdio: ['ignore', 'pipe', 'pipe'] }),
+    );
+
+    // No --credentials-file or --url in legacy args
+    const calledArgs = spawnImpl.mock.calls[0]?.[1] as string[];
+    expect(calledArgs).not.toContain('--credentials-file');
+    expect(calledArgs).not.toContain('--url');
+
+    await new Promise<void>((r) => setTimeout(r, 10));
+    child._exitWithCode(0);
+    await p.catch(() => {});
+  });
+});
+
+// ── B2: Quick-mode regression check ──────────────────────────────────────────
+
+describe('createTunnel — CA-3: quick mode regression (spawn args unchanged)', () => {
+  it('quick mode still spawns with unchanged quick-mode args after B2 changes', async () => {
+    const { createTunnel } = await import('./tunnel.js');
+
+    const child = makeFakeChild();
+    const spawnImpl = vi.fn().mockReturnValue(child);
+
+    const p = createTunnel({
+      localPort: 9000,
+      binaryPath: '/fake/cloudflared',
+      urlTimeoutMs: 5000,
+      spawnImpl,
+      tunnel: { mode: 'quick' },
+    });
+
+    const calledArgs = spawnImpl.mock.calls[0]?.[1] as string[];
+    expect(calledArgs).toContain('--url');
+    expect(calledArgs).toContain('http://127.0.0.1:9000');
+    expect(calledArgs).not.toContain('--credentials-file');
+    expect(calledArgs).not.toContain('run');
+
+    await new Promise<void>((r) => setTimeout(r, 10));
+    child.stderr.push('https://quick-mode-test.trycloudflare.com\n');
+    const tunnel = await p;
+    expect(tunnel.publicUrl).toBe('https://quick-mode-test.trycloudflare.com');
+  });
+});

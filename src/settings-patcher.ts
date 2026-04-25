@@ -28,6 +28,23 @@ import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { writeAtomic as writeAtomicShared } from './atomic-write.js';
 
+// ── Sentinel constant ─────────────────────────────────────────────────────────
+
+/**
+ * Substring sentinel used to identify claude-shotlink hook entries in
+ * settings.json. Using a substring (not a full path) means:
+ *
+ *   - v0.2 entries (full path ending with this substring) are auto-detected
+ *   - entries from different install locations (dev, npm-global, pnpm) are all
+ *     matched by a single contains-check
+ *   - duplicate entries from multiple install paths are collapsed to one on
+ *     re-install (the REPLACE branch in installHook fires)
+ *
+ * The sentinel is package-directory–scoped (`claude-shotlink/dist/hook.js`)
+ * which is stable across all install layouts that npm/pnpm use.
+ */
+export const SHOTLINK_HOOK_SENTINEL = 'claude-shotlink/dist/hook.js';
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 export interface InstallHookOpts {

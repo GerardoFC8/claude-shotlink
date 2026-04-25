@@ -70,6 +70,12 @@ function buildFakeDeps(overrides: Record<string, any> = {}): CliDeps {
     updatePidFileUrl: vi.fn().mockResolvedValue(undefined),
     purgeDedupCache: vi.fn().mockResolvedValue(undefined),
     startHealthcheck: vi.fn().mockReturnValue({ stop: vi.fn(), failCount: 0, stopped: false }),
+    setupTunnel: vi.fn().mockResolvedValue({
+      ok: true,
+      uuid: 'test-uuid',
+      credentialsFile: '/fake/creds.json',
+      dnsRouted: true,
+    }),
   };
 
   return { ...defaults, ...overrides } as unknown as CliDeps;
@@ -1245,6 +1251,55 @@ describe('handleInstallHook — quoted path in hookCommand', () => {
   });
 });
 
+// ── CA-4: Sentinel constant verification (TASK-007-a / TASK-008-a) ────────────
+//
+// These tests assert that handleInstallHook and handleUninstallHook pass
+// the exact sentinel constant 'claude-shotlink/dist/hook.js' (not the full
+// absolute hookPath). They FAIL (RED) before the constant is introduced in cli.ts.
+
+describe('CA-4 — handleInstallHook passes SHOTLINK_HOOK_SENTINEL as sentinel', () => {
+  it('sentinel passed to installHook is exactly "claude-shotlink/dist/hook.js"', async () => {
+    const { handleInstallHook } = await import('./cli.js');
+
+    let capturedSentinel: unknown;
+    const deps = buildFakeDeps({
+      installHook: vi.fn().mockImplementation(async (opts: Record<string, unknown>) => {
+        capturedSentinel = opts['sentinel'];
+        return { action: 'installed', backupPath: '/tmp/backup' };
+      }),
+    });
+
+    const code = await handleInstallHook(deps, { stdout: () => {}, stderr: () => {} });
+
+    expect(code).toBe(0);
+    // Must be the SUBSTRING constant, NOT a full absolute path
+    expect(capturedSentinel).toBe('claude-shotlink/dist/hook.js');
+  });
+});
+
+describe('CA-4 — handleUninstallHook passes SHOTLINK_HOOK_SENTINEL as sentinel', () => {
+  it('sentinel passed to uninstallHook is exactly "claude-shotlink/dist/hook.js"', async () => {
+    const { handleUninstallHook } = await import('./cli.js');
+
+    let capturedSentinel: unknown;
+    const deps = buildFakeDeps({
+      uninstallHook: vi.fn().mockImplementation(async (opts: Record<string, unknown>) => {
+        capturedSentinel = opts['sentinel'];
+        return { action: 'removed', backupPath: '/tmp/backup', removedCount: 1 };
+      }),
+    });
+
+    const code = await handleUninstallHook(['uninstall-hook'], deps, {
+      stdout: () => {},
+      stderr: () => {},
+    });
+
+    expect(code).toBe(0);
+    // Must be the SUBSTRING constant, NOT a full absolute path
+    expect(capturedSentinel).toBe('claude-shotlink/dist/hook.js');
+  });
+});
+
 // ── WARNING-1 regression: loadConfig throws descriptive error on bad JSON ─────
 
 describe('loadConfig — invalid JSON throws descriptive error', () => {
@@ -1514,5 +1569,511 @@ describe('handleStart — FIX-8: --tunnel-hostname validation', () => {
     expect(ensureBinary).toHaveBeenCalled();
     // Error should be about binary, not hostname
     expect(stderrLines.join('')).not.toMatch(/invalid.*hostname/i);
+  });
+});
+
+// ── B2: TASK-005-a RED — handleStart passes tunnelCredentialsFile + tunnelLocalPort through ──
+
+describe('handleStart — CA-3: passes tunnelCredentialsFile + tunnelLocalPort from config to createTunnel', () => {
+  it('TASK-005-a: createTunnel receives credentialsFile + localPort from config when both present', async () => {
+    const { handleStart } = await import('./cli.js');
+    const { writeFile, mkdtemp, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join: pj } = await import('node:path');
+
+    // FIX-3: use a real temp file with valid credentials JSON
+    const dir = await mkdtemp(pj(tmpdir(), 'task005a-test-'));
+    const credFile = pj(dir, 'abc.json');
+    await writeFile(credFile, JSON.stringify({ TunnelID: 'abc-id', TunnelName: 'shotlink' }), 'utf8');
+    try {
+      const createTunnel = vi.fn().mockResolvedValue({
+        publicUrl: 'https://shots.example.com',
+        stop: vi.fn().mockResolvedValue(undefined),
+        onUrlReady: vi.fn().mockReturnValue(() => {}),
+        onDrop: vi.fn().mockReturnValue(() => {}),
+      });
+
+      const configWithCredentials = {
+        apiKey: 'sk_' + 'a'.repeat(64),
+        createdAt: new Date().toISOString(),
+        tunnelMode: 'named' as const,
+        tunnelName: 'shotlink',
+        tunnelHostname: 'shots.example.com',
+        tunnelCredentialsFile: credFile,
+        tunnelLocalPort: 7331,
+      };
+
+      const deps = buildFakeDeps({
+        ensureConfig: vi.fn().mockResolvedValue(configWithCredentials),
+        createTunnel,
+      });
+
+      const code = await handleStart(
+        ['start'],
+        deps,
+        {
+          stdout: () => {},
+          stderr: () => {},
+          abortAfterReady: true,
+          // fileExists returns true for the real temp file
+          fileExists: () => true,
+        },
+      );
+
+      expect(code).toBe(0);
+      expect(createTunnel).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tunnel: expect.objectContaining({
+            mode: 'named',
+            name: 'shotlink',
+            hostname: 'shots.example.com',
+            credentialsFile: credFile,
+            localPort: 7331,
+          }),
+        }),
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('TASK-005-a: --port CLI flag differs from config tunnelLocalPort → warning printed, new port used', async () => {
+    const { handleStart } = await import('./cli.js');
+    const { writeFile, mkdtemp, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join: pj } = await import('node:path');
+
+    // FIX-3: use a real temp file with valid credentials JSON
+    const dir = await mkdtemp(pj(tmpdir(), 'task005a-port-test-'));
+    const credFile = pj(dir, 'abc.json');
+    await writeFile(credFile, JSON.stringify({ TunnelID: 'abc-id', TunnelName: 'shotlink' }), 'utf8');
+    try {
+      const createTunnel = vi.fn().mockResolvedValue({
+        publicUrl: 'https://shots.example.com',
+        stop: vi.fn().mockResolvedValue(undefined),
+        onUrlReady: vi.fn().mockReturnValue(() => {}),
+        onDrop: vi.fn().mockReturnValue(() => {}),
+      });
+
+      const configWithCredentials = {
+        apiKey: 'sk_' + 'a'.repeat(64),
+        createdAt: new Date().toISOString(),
+        tunnelMode: 'named' as const,
+        tunnelName: 'shotlink',
+        tunnelHostname: 'shots.example.com',
+        tunnelCredentialsFile: credFile,
+        tunnelLocalPort: 7331,
+      };
+
+      const deps = buildFakeDeps({
+        ensureConfig: vi.fn().mockResolvedValue(configWithCredentials),
+        createTunnel,
+      });
+
+      const stderrLines: string[] = [];
+      const code = await handleStart(
+        ['start', '--port', '8080'],
+        deps,
+        {
+          stdout: () => {},
+          stderr: (s) => stderrLines.push(s),
+          abortAfterReady: true,
+          fileExists: () => true,
+        },
+      );
+
+      expect(code).toBe(0);
+      // Warning about port mismatch must be printed
+      expect(stderrLines.join(' ')).toMatch(/warning/i);
+      expect(stderrLines.join(' ')).toMatch(/port/i);
+      // createTunnel receives the CLI port override
+      expect(createTunnel).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tunnel: expect.objectContaining({
+            localPort: 8080,
+          }),
+        }),
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── B2: TASK-006-a RED — handleStart fast-fails when credentialsFile missing on disk ──
+
+describe('handleStart — CA-3: exits 1 when tunnelCredentialsFile is set but file absent', () => {
+  it('TASK-006-a: exits 1 with error message when tunnelCredentialsFile path does not exist on disk', async () => {
+    const { handleStart } = await import('./cli.js');
+
+    const configWithMissingCredentials = {
+      apiKey: 'sk_' + 'a'.repeat(64),
+      createdAt: new Date().toISOString(),
+      tunnelMode: 'named' as const,
+      tunnelName: 'shotlink',
+      tunnelHostname: 'shots.example.com',
+      tunnelCredentialsFile: '/nonexistent/path/abc.json',
+      tunnelLocalPort: 7331,
+    };
+
+    const createTunnel = vi.fn().mockResolvedValue({
+      publicUrl: 'https://shots.example.com',
+      stop: vi.fn().mockResolvedValue(undefined),
+      onUrlReady: vi.fn().mockReturnValue(() => {}),
+      onDrop: vi.fn().mockReturnValue(() => {}),
+    });
+
+    const deps = buildFakeDeps({
+      ensureConfig: vi.fn().mockResolvedValue(configWithMissingCredentials),
+      createTunnel,
+    });
+
+    const stderrLines: string[] = [];
+    const code = await handleStart(
+      ['start'],
+      deps,
+      {
+        stdout: () => {},
+        stderr: (s) => stderrLines.push(s),
+        exitFn: () => {},
+        // fileExists returns false → simulate missing credentials file on disk
+        fileExists: () => false,
+      },
+    );
+
+    expect(code).toBe(1);
+    // createTunnel must NOT have been called (fast-fail before spawn)
+    expect(createTunnel).not.toHaveBeenCalled();
+    // Error message should mention credentials file
+    expect(stderrLines.join(' ')).toMatch(/credentials.*file|credentials-file/i);
+  });
+});
+
+// ── FIX-1: Port resolution asymmetry fix ─────────────────────────────────────
+
+describe('handleStart — FIX-1: --port always honoured when named-mode without credentials', () => {
+  // JD R2 clarification (C2): in legacy named mode (no tunnelCredentialsFile),
+  // the user's ~/.cloudflared/config.yml controls cloudflared's ingress port.
+  // The CLI --port flag controls ONLY the local HTTP server port, NOT the
+  // tunnel's proxy target. This test asserts the local-server-port behavior
+  // (which is what the user expects when passing --port). It does NOT assert
+  // anything about createTunnel's tunnel.localPort — that field is only
+  // forwarded when credentialsFile is set (the new --credentials-file path).
+  it('FIX-1 RED: --port 9000 with named config WITHOUT credentialsFile → local server uses port 9000 (cloudflared reads its own config.yml for ingress)', async () => {
+    const { handleStart } = await import('./cli.js');
+
+    const createTunnel = vi.fn().mockResolvedValue({
+      publicUrl: 'https://shots.example.com',
+      stop: vi.fn().mockResolvedValue(undefined),
+      onUrlReady: vi.fn().mockReturnValue(() => {}),
+      onDrop: vi.fn().mockReturnValue(() => {}),
+    });
+
+    // Config has named mode but NO tunnelCredentialsFile
+    const configNamedNoCredentials = {
+      apiKey: 'sk_' + 'a'.repeat(64),
+      createdAt: new Date().toISOString(),
+      tunnelMode: 'named' as const,
+      tunnelName: 'shotlink',
+      tunnelHostname: 'shots.example.com',
+      // No tunnelCredentialsFile, no tunnelLocalPort
+    };
+
+    const startServer = vi.fn().mockResolvedValue({
+      port: 9000,
+      host: '127.0.0.1',
+      close: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const deps = buildFakeDeps({
+      ensureConfig: vi.fn().mockResolvedValue(configNamedNoCredentials),
+      createTunnel,
+      startServer,
+    });
+
+    const code = await handleStart(
+      ['start', '--port', '9000'],
+      deps,
+      {
+        stdout: () => {},
+        stderr: () => {},
+        abortAfterReady: true,
+        fileExists: () => true,
+      },
+    );
+
+    expect(code).toBe(0);
+    // startServer should have received port 9000
+    expect(startServer).toHaveBeenCalledWith(
+      expect.objectContaining({ port: 9000 }),
+    );
+  });
+
+  it('FIX-1 GREEN: --port 8080 with named-mode + credentials → warning + port used', async () => {
+    const { handleStart } = await import('./cli.js');
+    const { writeFile, mkdtemp, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join: pj } = await import('node:path');
+
+    // FIX-3: credentials JSON must be valid for the read-and-validate to succeed
+    const dir = await mkdtemp(pj(tmpdir(), 'fix1-green-test-'));
+    const credFile = pj(dir, 'abc.json');
+    await writeFile(credFile, JSON.stringify({ TunnelID: 'abc-id', TunnelName: 'shotlink' }), 'utf8');
+    try {
+      const createTunnel = vi.fn().mockResolvedValue({
+        publicUrl: 'https://shots.example.com',
+        stop: vi.fn().mockResolvedValue(undefined),
+        onUrlReady: vi.fn().mockReturnValue(() => {}),
+        onDrop: vi.fn().mockReturnValue(() => {}),
+      });
+
+      const configWithCredentials = {
+        apiKey: 'sk_' + 'a'.repeat(64),
+        createdAt: new Date().toISOString(),
+        tunnelMode: 'named' as const,
+        tunnelName: 'shotlink',
+        tunnelHostname: 'shots.example.com',
+        tunnelCredentialsFile: credFile,
+        tunnelLocalPort: 7331,
+      };
+
+      const deps = buildFakeDeps({
+        ensureConfig: vi.fn().mockResolvedValue(configWithCredentials),
+        createTunnel,
+      });
+
+      const stderrLines: string[] = [];
+      const code = await handleStart(
+        ['start', '--port', '8080'],
+        deps,
+        {
+          stdout: () => {},
+          stderr: (s) => stderrLines.push(s),
+          abortAfterReady: true,
+          fileExists: () => true,
+        },
+      );
+
+      expect(code).toBe(0);
+      // Warning about port mismatch
+      expect(stderrLines.join(' ')).toMatch(/warning/i);
+      // createTunnel receives port 8080
+      expect(createTunnel).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tunnel: expect.objectContaining({ localPort: 8080 }),
+        }),
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── FIX-3: Credentials JSON shape validation in handleStart ───────────────────
+
+describe('handleStart — FIX-3: validates credentials JSON shape before spawn', () => {
+  function buildConfigWithCreds(credFile: string) {
+    return {
+      apiKey: 'sk_' + 'a'.repeat(64),
+      createdAt: new Date().toISOString(),
+      tunnelMode: 'named' as const,
+      tunnelName: 'shotlink',
+      tunnelHostname: 'shots.example.com',
+      tunnelCredentialsFile: credFile,
+      tunnelLocalPort: 7331,
+    };
+  }
+
+  it('FIX-3 RED: exits 1 when credentials file contains malformed JSON', async () => {
+    const { handleStart } = await import('./cli.js');
+    const { writeFile, mkdir, mkdtemp, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join: pj } = await import('node:path');
+
+    const dir = await mkdtemp(pj(tmpdir(), 'fix3-test-'));
+    const credFile = pj(dir, 'creds.json');
+    try {
+      await writeFile(credFile, '{ not valid json {{', 'utf8');
+
+      const createTunnel = vi.fn();
+      const deps = buildFakeDeps({
+        ensureConfig: vi.fn().mockResolvedValue(buildConfigWithCreds(credFile)),
+        createTunnel,
+      });
+
+      const stderrLines: string[] = [];
+      const code = await handleStart(
+        ['start'],
+        deps,
+        {
+          stdout: () => {},
+          stderr: (s) => stderrLines.push(s),
+          fileExists: () => true,
+        },
+      );
+
+      expect(code).toBe(1);
+      expect(createTunnel).not.toHaveBeenCalled();
+      // JD R2 fix: malformed JSON gets its own distinct message
+      expect(stderrLines.join(' ')).toMatch(/contains invalid JSON/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('FIX-3 RED: exits 1 when credentials JSON is missing TunnelID', async () => {
+    const { handleStart } = await import('./cli.js');
+    const { writeFile, mkdtemp, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join: pj } = await import('node:path');
+
+    const dir = await mkdtemp(pj(tmpdir(), 'fix3-test-'));
+    const credFile = pj(dir, 'creds.json');
+    try {
+      // Valid JSON but missing TunnelID
+      await writeFile(credFile, JSON.stringify({ TunnelName: 'shotlink', AccountTag: 'abc' }), 'utf8');
+
+      const createTunnel = vi.fn();
+      const deps = buildFakeDeps({
+        ensureConfig: vi.fn().mockResolvedValue(buildConfigWithCreds(credFile)),
+        createTunnel,
+      });
+
+      const stderrLines: string[] = [];
+      const code = await handleStart(
+        ['start'],
+        deps,
+        {
+          stdout: () => {},
+          stderr: (s) => stderrLines.push(s),
+          fileExists: () => true,
+        },
+      );
+
+      expect(code).toBe(1);
+      expect(createTunnel).not.toHaveBeenCalled();
+      // JD R2 fix: missing fields gets its own distinct message
+      expect(stderrLines.join(' ')).toMatch(/missing required fields/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('JD-R2 RED: exits 1 when credentials JSON is missing TunnelName (symmetric to TunnelID)', async () => {
+    const { handleStart } = await import('./cli.js');
+    const { writeFile, mkdtemp, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join: pj } = await import('node:path');
+
+    const dir = await mkdtemp(pj(tmpdir(), 'jdr2-test-'));
+    const credFile = pj(dir, 'creds.json');
+    try {
+      // Valid JSON but missing TunnelName (TunnelID present)
+      await writeFile(credFile, JSON.stringify({ TunnelID: 'abc-123', AccountTag: 'xyz' }), 'utf8');
+
+      const createTunnel = vi.fn();
+      const deps = buildFakeDeps({
+        ensureConfig: vi.fn().mockResolvedValue(buildConfigWithCreds(credFile)),
+        createTunnel,
+      });
+
+      const stderrLines: string[] = [];
+      const code = await handleStart(
+        ['start'],
+        deps,
+        {
+          stdout: () => {},
+          stderr: (s) => stderrLines.push(s),
+          fileExists: () => true,
+        },
+      );
+
+      expect(code).toBe(1);
+      expect(createTunnel).not.toHaveBeenCalled();
+      expect(stderrLines.join(' ')).toMatch(/missing required fields/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('JD-R2 RED: exits 1 with read-error message when credentials path is unreadable', async () => {
+    const { handleStart } = await import('./cli.js');
+    const createTunnel = vi.fn();
+    // Use a path that fileExists says exists but readFileAsync will fail on
+    // (a directory, which raises EISDIR on readFile)
+    const { mkdtemp, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join: pj } = await import('node:path');
+
+    const dir = await mkdtemp(pj(tmpdir(), 'jdr2-readfail-'));
+    try {
+      const deps = buildFakeDeps({
+        ensureConfig: vi.fn().mockResolvedValue(buildConfigWithCreds(dir)),
+        createTunnel,
+      });
+
+      const stderrLines: string[] = [];
+      const code = await handleStart(
+        ['start'],
+        deps,
+        {
+          stdout: () => {},
+          stderr: (s) => stderrLines.push(s),
+          fileExists: () => true,
+        },
+      );
+
+      expect(code).toBe(1);
+      expect(createTunnel).not.toHaveBeenCalled();
+      // Read error gets its own distinct message — does NOT mention "missing fields"
+      expect(stderrLines.join(' ')).toMatch(/Cannot read credentials file/i);
+      expect(stderrLines.join(' ')).not.toMatch(/missing required fields/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('FIX-3 GREEN: proceeds to createTunnel when credentials JSON has TunnelID + TunnelName', async () => {
+    const { handleStart } = await import('./cli.js');
+    const { writeFile, mkdtemp, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join: pj } = await import('node:path');
+
+    const dir = await mkdtemp(pj(tmpdir(), 'fix3-test-'));
+    const credFile = pj(dir, 'creds.json');
+    try {
+      await writeFile(
+        credFile,
+        JSON.stringify({ TunnelID: 'abc-123', TunnelName: 'shotlink', AccountTag: 'xyz' }),
+        'utf8',
+      );
+
+      const createTunnel = vi.fn().mockResolvedValue({
+        publicUrl: 'https://shots.example.com',
+        stop: vi.fn().mockResolvedValue(undefined),
+        onUrlReady: vi.fn().mockReturnValue(() => {}),
+        onDrop: vi.fn().mockReturnValue(() => {}),
+      });
+      const deps = buildFakeDeps({
+        ensureConfig: vi.fn().mockResolvedValue(buildConfigWithCreds(credFile)),
+        createTunnel,
+      });
+
+      const code = await handleStart(
+        ['start'],
+        deps,
+        {
+          stdout: () => {},
+          stderr: () => {},
+          abortAfterReady: true,
+          fileExists: () => true,
+        },
+      );
+
+      expect(code).toBe(0);
+      expect(createTunnel).toHaveBeenCalled();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

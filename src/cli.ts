@@ -23,6 +23,8 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { existsSync } from 'node:fs';
+import { readFile as readFileAsync } from 'node:fs/promises';
+import { homedir } from 'node:os';
 
 import { ensureConfig, loadConfig, saveConfig as saveConfigImpl, rotateApiKey as rotateApiKeyImpl, HOSTNAME_RE } from './config.js';
 import type { Config } from './config.js';
@@ -35,6 +37,7 @@ import {
   uninstallHook as uninstallHookImpl,
   listBackups as listBackupsImpl,
   restoreBackup as restoreBackupImpl,
+  SHOTLINK_HOOK_SENTINEL,
 } from './settings-patcher.js';
 import {
   writePidFile as writePidFileImpl,
@@ -54,6 +57,7 @@ import {
   type HealthcheckHandle,
 } from './healthcheck.js';
 import { DedupCache, DEDUP_PATH } from './dedup-cache.js';
+import { runSetupTunnel, defaultSetupTunnelDeps, type SetupTunnelInput, type SetupTunnelResult } from './setup-tunnel.js';
 
 // ── Re-exported types for tests ───────────────────────────────────────────────
 
@@ -85,6 +89,7 @@ export interface TunnelHandle {
 /**
  * Options for createTunnel. v0.2: `tunnel` is optional — absent means quick mode.
  * Named mode: tunnel.mode === 'named' requires name + hostname.
+ * v0.3: named mode optionally includes credentialsFile + localPort for inline-args spawn.
  */
 export interface TunnelStartOpts {
   localPort: number;
@@ -92,7 +97,15 @@ export interface TunnelStartOpts {
   /** v0.2: when absent → quick-mode (v0.1 behavior). */
   tunnel?:
     | { mode: 'quick' }
-    | { mode: 'named'; name: string; hostname: string };
+    | {
+        mode: 'named';
+        name: string;
+        hostname: string;
+        /** v0.3: when present (with localPort), spawns with --credentials-file + --url */
+        credentialsFile?: string;
+        /** v0.3: local port for --url arg; required when credentialsFile is set */
+        localPort?: number;
+      };
 }
 
 export interface PidMetaResult {
@@ -170,6 +183,8 @@ export interface CliDeps {
   purgeDedupCache: () => Promise<void>;
   /** v0.2: start the edge healthcheck poll. Injectable for tests. */
   startHealthcheck: (opts: HealthcheckOptions) => HealthcheckHandle;
+  /** v0.3: setup-tunnel wizard orchestration. Injected for testability. */
+  setupTunnel: (input: SetupTunnelInput, configPath: string) => Promise<SetupTunnelResult>;
 }
 
 // ── IO abstraction ────────────────────────────────────────────────────────────
@@ -188,6 +203,11 @@ export interface CliIO {
    * of process.exit so tests can capture the exit code.
    */
   exitFn?: (code: number) => void;
+  /**
+   * Injectable file-existence check for tests. Defaults to fs.existsSync.
+   * Used by handleStart to verify tunnelCredentialsFile exists before spawning.
+   */
+  fileExists?: (p: string) => boolean;
 }
 
 // ── defaultDeps ───────────────────────────────────────────────────────────────
@@ -251,6 +271,11 @@ export function defaultDeps(): CliDeps {
       await cache.purge();
     },
     startHealthcheck: startHealthcheckImpl,
+    setupTunnel: async (input, configPath) => {
+      const binaryPath = await ensureBinaryImpl();
+      const deps = defaultSetupTunnelDeps(binaryPath, configPath, ensureConfig, saveConfigImpl);
+      return runSetupTunnel(input, deps);
+    },
   };
 }
 
@@ -298,12 +323,15 @@ export async function dispatch(
     case 'logs':
       return handleLogs(argv, deps, { ...io, stdout: out, stderr: err });
 
+    case 'setup-tunnel':
+      return handleSetupTunnel(argv, deps, { stdout: out, stderr: err });
+
     case 'configure-tunnel':
       return handleConfigureTunnel(argv, deps, { stdout: out, stderr: err });
 
     default:
       err(`Unknown command: ${cmd}`);
-      err('Usage: claude-shotlink <start|stop|status|install-hook|uninstall-hook|rotate-key|logs|configure-tunnel> [--version]');
+      err('Usage: claude-shotlink <start|stop|status|install-hook|uninstall-hook|rotate-key|logs|setup-tunnel|configure-tunnel> [--version]');
       return 1;
   }
 }
@@ -317,6 +345,7 @@ export async function handleStart(
 ): Promise<number> {
   const out = io.stdout ?? ((s: string) => process.stdout.write(s + '\n'));
   const err = io.stderr ?? ((s: string) => process.stderr.write(s + '\n'));
+  const fileExistsFn = io.fileExists ?? existsSync;
 
   // Parse flags
   let port = 0;
@@ -411,7 +440,7 @@ export async function handleStart(
   let resolvedTunnelOpts: TunnelStartOpts['tunnel'];
 
   if (cliTunnelName !== undefined && cliTunnelHostname !== undefined) {
-    // CLI flags win — named mode
+    // CLI flags win — named mode (legacy v0.2 CLI path; no credentials file here)
     resolvedTunnelOpts = { mode: 'named', name: cliTunnelName, hostname: cliTunnelHostname };
   } else if (config.tunnelMode === 'named') {
     // Config says named — validate completeness
@@ -424,10 +453,88 @@ export async function handleStart(
       await storage.shutdown();
       return 1;
     }
+
+    // v0.3: if credentials file is configured, guard that it exists before spawning
+    if (config.tunnelCredentialsFile) {
+      if (!fileExistsFn(config.tunnelCredentialsFile)) {
+        err(
+          `Credentials file not found at ${config.tunnelCredentialsFile}. ` +
+          `Re-run \`claude-shotlink setup-tunnel --name ${config.tunnelName} --hostname ${config.tunnelHostname}\` to recreate.`,
+        );
+        await server.close();
+        await storage.shutdown();
+        return 1;
+      }
+
+      // FIX-3: validate credentials JSON shape before spawning cloudflared.
+      // A bogus path that exists but has wrong content produces a cryptic cloudflared
+      // spawn error. Fail fast with a clear message instead.
+      // JD Round 2 (C1 + SA-2): each failure mode gets a distinct, actionable message
+      // so users diagnosing EACCES vs malformed JSON vs missing fields aren't misled.
+      let credsRaw: string;
+      try {
+        credsRaw = await readFileAsync(config.tunnelCredentialsFile, 'utf8');
+      } catch (e) {
+        err(
+          `Cannot read credentials file at '${config.tunnelCredentialsFile}': ${String(e)}. ` +
+          `Check file permissions, or re-run setup-tunnel.`,
+        );
+        await server.close();
+        await storage.shutdown();
+        return 1;
+      }
+      let credsParsed: unknown;
+      try {
+        credsParsed = JSON.parse(credsRaw);
+      } catch (e) {
+        err(
+          `Credentials file at '${config.tunnelCredentialsFile}' contains invalid JSON: ${String(e)}. ` +
+          `Fix the file manually or re-run setup-tunnel.`,
+        );
+        await server.close();
+        await storage.shutdown();
+        return 1;
+      }
+      const credsObj = (credsParsed !== null && typeof credsParsed === 'object') ? credsParsed as Record<string, unknown> : {};
+      if (typeof credsObj['TunnelID'] !== 'string' || typeof credsObj['TunnelName'] !== 'string') {
+        err(
+          `Credentials file at '${config.tunnelCredentialsFile}' is missing required fields ` +
+          `(TunnelID and TunnelName). Re-run setup-tunnel to recreate.`,
+        );
+        await server.close();
+        await storage.shutdown();
+        return 1;
+      }
+    }
+
+    // FIX-1: resolve effective local port — CLI --port ALWAYS overrides config
+    // tunnelLocalPort when present, regardless of credentialsFile presence.
+    // Previously the condition gated on credentialsFile which silently ignored
+    // --port when named-mode config had no credentials file.
+    let effectiveLocalPort: number | undefined = config.tunnelLocalPort;
+    if (port !== 0) {
+      // A CLI --port was specified; warn if it differs from config tunnelLocalPort
+      if (config.tunnelCredentialsFile && config.tunnelLocalPort !== undefined && port !== config.tunnelLocalPort) {
+        err(
+          `WARNING: --port ${port} overrides tunnelLocalPort=${config.tunnelLocalPort} from config. ` +
+          `The tunnel was set up to proxy to port ${config.tunnelLocalPort}; cloudflared will fail to reach ` +
+          `127.0.0.1:${port}. Re-run setup-tunnel with --port ${port} to fix.`,
+        );
+      }
+      effectiveLocalPort = port;
+    }
+
     resolvedTunnelOpts = {
       mode: 'named',
       name: config.tunnelName,
       hostname: config.tunnelHostname,
+      // v0.3: pass through credentials file + port when present; absent → legacy path
+      ...(config.tunnelCredentialsFile
+        ? {
+            credentialsFile: config.tunnelCredentialsFile,
+            localPort: effectiveLocalPort ?? server.port,
+          }
+        : {}),
     };
   } else {
     // Default: quick mode
@@ -784,7 +891,7 @@ export async function handleInstallHook(
       settingsPath,
       hookCommand,
       matcher: 'Bash|Write',
-      sentinel: hookPath,
+      sentinel: SHOTLINK_HOOK_SENTINEL,
     });
 
     if (result.action === 'already-present') {
@@ -832,7 +939,7 @@ export async function handleUninstallHook(
   }
 
   try {
-    const result = await deps.uninstallHook({ settingsPath, sentinel: hookPath });
+    const result = await deps.uninstallHook({ settingsPath, sentinel: SHOTLINK_HOOK_SENTINEL });
     if (result.action === 'not-present') {
       io.stdout('Hook not installed.');
     } else {
@@ -854,6 +961,110 @@ export async function handleRotateKey(
   const config = await deps.rotateApiKey();
   io.stdout(config.apiKey);
   io.stderr('Restart the relay to apply the new key.');
+  return 0;
+}
+
+// ── handleSetupTunnel ─────────────────────────────────────────────────────────
+
+/**
+ * `setup-tunnel` subcommand handler (CA-1, B5, TASK-016/017).
+ *
+ * Accepts:
+ *   --name <name>         (required, defaults to "shotlink")
+ *   --hostname <fqdn>     (required)
+ *   --port <n>            (optional, defaults to 7331)
+ *   --skip-dns            (optional, skips DNS routing step)
+ *
+ * Parses flags, calls deps.setupTunnel (the orchestration module), and
+ * prints success/failure messages. On success, config is written by the
+ * setup-tunnel module before returning.
+ *
+ * Exit codes:
+ *   0 — tunnel created + config written (DNS may have failed but is recoverable)
+ *   1 — missing cert, invalid flags, or create/parse failed
+ */
+export async function handleSetupTunnel(
+  argv: string[],
+  deps: CliDeps,
+  io: { stdout: (s: string) => void; stderr: (s: string) => void },
+): Promise<number> {
+  const out = io.stdout;
+  const err = io.stderr;
+
+  let name = 'shotlink';
+  let hostname: string | undefined;
+  let port = 7331;
+  let skipDns = false;
+
+  // Parse flags
+  for (let i = 1; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === '--name' && argv[i + 1]) {
+      name = argv[++i]!;
+    } else if (arg === '--hostname' && argv[i + 1]) {
+      hostname = argv[++i];
+    } else if (arg === '--port' && argv[i + 1]) {
+      const rawPort = parseInt(argv[++i]!, 10);
+      if (!Number.isFinite(rawPort) || rawPort < 1 || rawPort > 65535) {
+        err(`Invalid --port value: "${argv[i]}" (must be an integer between 1 and 65535)`);
+        return 1;
+      }
+      port = rawPort;
+    } else if (arg === '--skip-dns') {
+      skipDns = true;
+    }
+  }
+
+  // Validate required flags
+  if (!hostname) {
+    err('setup-tunnel requires both --name and --hostname.');
+    err('Usage: setup-tunnel --name <tunnel> --hostname <fqdn> [--port 7331] [--skip-dns]');
+    return 1;
+  }
+
+  // Validate hostname shape (CA-1.1)
+  if (!HOSTNAME_RE.test(hostname)) {
+    err(
+      `Invalid --hostname: "${hostname}" — expected a bare hostname (no scheme, no path), e.g. "shots.example.com".`,
+    );
+    return 1;
+  }
+
+  // Find CONFIG_PATH — use the same path as ensureConfig
+  const CONFIG_PATH = join(homedir(), '.claude-shotlink', 'config.json');
+
+  // Call the setup-tunnel orchestration module
+  const result = await deps.setupTunnel({ name, hostname, port, skipDns }, CONFIG_PATH);
+
+  if (!result.ok) {
+    // Failure cases
+    err(result.message);
+    if (result.recoveryHint) {
+      err(`  hint: ${result.recoveryHint}`);
+    }
+    return 1;
+  }
+
+  // Success case (ok: true).
+  // FIX-4: setup-tunnel module already saves all 5 fields (tunnelMode, tunnelName,
+  // tunnelHostname, tunnelCredentialsFile, tunnelLocalPort) atomically inside
+  // runSetupTunnel. The previous redundant saveConfig call here could silently
+  // overwrite if the two saves diverged, so it is removed.
+
+  // Print success summary
+  out(`Tunnel created successfully`);
+  out(`  name:      ${name}`);
+  out(`  hostname:  ${hostname}`);
+  out(`  UUID:      ${result.uuid}`);
+  out(`  creds:     ${result.credentialsFile}`);
+
+  if (result.dnsManualCommand) {
+    out(`  DNS:       manual (run: ${result.dnsManualCommand})`);
+  } else if (result.dnsRouted) {
+    out(`  DNS:       routed`);
+  }
+
+  out(`\nConfig written. Next: claude-shotlink start`);
   return 0;
 }
 
@@ -930,10 +1141,14 @@ export async function handleConfigureTunnel(
   if (mode === 'named') {
     next.tunnelName = name;
     next.tunnelHostname = hostname;
+    // PRESERVE v0.3 fields when staying in named mode (Open Point 3)
+    // tunnelCredentialsFile + tunnelLocalPort remain untouched if they exist
   } else {
-    // quick mode: clear the named-only fields
+    // quick mode: clear the named-only fields AND the v0.3 fields
     delete next.tunnelName;
     delete next.tunnelHostname;
+    delete next.tunnelCredentialsFile;
+    delete next.tunnelLocalPort;
   }
 
   await deps.saveConfig(next);
