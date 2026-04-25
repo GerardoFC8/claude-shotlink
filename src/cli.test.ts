@@ -1809,6 +1809,66 @@ describe('handleStart — FIX-1: --port always honoured when named-mode without 
     );
   });
 
+  it('v0.3.2 RED: start without --port but with tunnelLocalPort in config → startServer uses tunnelLocalPort (not OS-assigned 0)', async () => {
+    // The wizard saves tunnelLocalPort=18080 to config. Running `start` without
+    // --port must pick up 18080 for the local server, otherwise the tunnel proxies
+    // to a port the server isn't listening on (cloudflared 502).
+    const { handleStart } = await import('./cli.js');
+    const { writeFile, mkdtemp, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join: pj } = await import('node:path');
+
+    const dir = await mkdtemp(pj(tmpdir(), 'v032-test-'));
+    const credFile = pj(dir, 'creds.json');
+    try {
+      await writeFile(
+        credFile,
+        JSON.stringify({ TunnelID: 'abc-123', AccountTag: 'xyz' }),
+        'utf8',
+      );
+
+      const startServer = vi.fn().mockResolvedValue({
+        port: 18080,
+        host: '127.0.0.1',
+        close: vi.fn().mockResolvedValue(undefined),
+      });
+
+      const configWithPort = {
+        apiKey: 'sk_' + 'a'.repeat(64),
+        createdAt: new Date().toISOString(),
+        tunnelMode: 'named' as const,
+        tunnelName: 'shotlink',
+        tunnelHostname: 'shots.example.com',
+        tunnelCredentialsFile: credFile,
+        tunnelLocalPort: 18080,
+      };
+
+      const deps = buildFakeDeps({
+        ensureConfig: vi.fn().mockResolvedValue(configWithPort),
+        startServer,
+      });
+
+      const code = await handleStart(
+        ['start'],   // NO --port flag — must inherit from config
+        deps,
+        {
+          stdout: () => {},
+          stderr: () => {},
+          abortAfterReady: true,
+          fileExists: () => true,
+        },
+      );
+
+      expect(code).toBe(0);
+      // CRITICAL: startServer must receive 18080 (from config), not 0 (default)
+      expect(startServer).toHaveBeenCalledWith(
+        expect.objectContaining({ port: 18080 }),
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('FIX-1 GREEN: --port 8080 with named-mode + credentials → warning + port used', async () => {
     const { handleStart } = await import('./cli.js');
     const { writeFile, mkdtemp, rm } = await import('node:fs/promises');

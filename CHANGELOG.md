@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _None yet._
 
+## [0.3.2] — 2026-04-25
+
+### Fixed
+
+- **Server port now inherits from `tunnelLocalPort` config when no `--port` CLI flag is given**:
+  The setup-tunnel wizard saves `tunnelLocalPort` to config, and `start` was
+  correctly passing it to the cloudflared spawn (`--url http://127.0.0.1:<port>`),
+  but NOT to the local HTTP server — which fell back to an OS-assigned random port.
+  Result: cloudflared proxied to the configured port, but the relay was listening
+  on a different port → every request returned 502 Bad Gateway from Cloudflare.
+  Same port-resolution asymmetry class as the JD R2 fix in v0.3.0, but on the
+  server side instead of the tunnel side.
+
+  Workaround for v0.3.0/v0.3.1 users: pass `--port <n>` explicitly to `start`.
+  v0.3.2 makes that automatic.
+
 ## [0.3.1] — 2026-04-25
 
 ### Fixed

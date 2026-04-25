@@ -409,12 +409,19 @@ export async function handleStart(
   let tunnelHandle: TunnelHandle | null = null;
   const getPublicBaseUrl = (): string | null => tunnelHandle?.publicUrl ?? null;
 
+  // v0.3.2 fix: when no --port CLI flag is given but config has tunnelLocalPort
+  // (set by setup-tunnel wizard), the server MUST use that port — otherwise it
+  // picks an OS-assigned port and the tunnel proxies to a port nothing's listening
+  // on (cloudflared returns 502 Bad Gateway). Same precedence as effectiveLocalPort:
+  // CLI > config > 0 (OS-assigned default).
+  const serverPort = port !== 0 ? port : (config.tunnelLocalPort ?? 0);
+
   let server: ServerHandle;
   try {
     server = await deps.startServer({
       config,
       storage,
-      port,
+      port: serverPort,
       host: '127.0.0.1',
       publicBaseUrl: getPublicBaseUrl,
     });
