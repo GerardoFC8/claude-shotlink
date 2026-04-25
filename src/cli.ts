@@ -24,7 +24,8 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { existsSync } from 'node:fs';
 
-import { ensureConfig, loadConfig, rotateApiKey as rotateApiKeyImpl } from './config.js';
+import { ensureConfig, loadConfig, saveConfig as saveConfigImpl, rotateApiKey as rotateApiKeyImpl, HOSTNAME_RE } from './config.js';
+import type { Config } from './config.js';
 import { Storage } from './storage.js';
 import { startServer as startServerImpl } from './server.js';
 import { ensureBinary as ensureBinaryImpl } from './cloudflared-bin.js';
@@ -40,16 +41,33 @@ import {
   readPidFile as readPidFileImpl,
   deletePidFile as deletePidFileImpl,
   isProcessAlive as isProcessAliveImpl,
+  updatePidFileUrl as updatePidFileUrlImpl,
 } from './pid.js';
 import {
   appendLog as appendLogImpl,
   readTail as readTailImpl,
   followTail as followTailImpl,
 } from './logger.js';
+import {
+  startHealthcheck as startHealthcheckImpl,
+  type HealthcheckOptions,
+  type HealthcheckHandle,
+} from './healthcheck.js';
+import { DedupCache, DEDUP_PATH } from './dedup-cache.js';
 
 // ── Re-exported types for tests ───────────────────────────────────────────────
 
 export type { Config } from './config.js';
+
+/**
+ * Orchestration state for handleStart. Lives in the handleStart closure.
+ * The tunnel's own state field is informational; orchestration state lives here.
+ *
+ * running      — server up, tunnel up, healthcheck running
+ * reconnecting — healthcheck triggered onFail, mid-replace
+ * shuttingDown — SIGTERM/SIGINT/TTL fired (terminal)
+ */
+export type RelayState = 'running' | 'reconnecting' | 'shuttingDown';
 
 export interface ServerHandle {
   port: number;
@@ -62,6 +80,19 @@ export interface TunnelHandle {
   stop(gracefulMs?: number): Promise<void>;
   onUrlReady(cb: (url: string) => void): () => void;
   onDrop(cb: () => void): () => void;
+}
+
+/**
+ * Options for createTunnel. v0.2: `tunnel` is optional — absent means quick mode.
+ * Named mode: tunnel.mode === 'named' requires name + hostname.
+ */
+export interface TunnelStartOpts {
+  localPort: number;
+  binaryPath: string;
+  /** v0.2: when absent → quick-mode (v0.1 behavior). */
+  tunnel?:
+    | { mode: 'quick' }
+    | { mode: 'named'; name: string; hostname: string };
 }
 
 export interface PidMetaResult {
@@ -96,22 +127,19 @@ export interface StorageInstance {
 // ── Dependency injection contract ─────────────────────────────────────────────
 
 export interface CliDeps {
-  ensureConfig: () => Promise<{ apiKey: string; createdAt: string }>;
-  loadConfig: () => Promise<{ apiKey: string; createdAt: string }>;
-  rotateApiKey: () => Promise<{ apiKey: string; createdAt: string }>;
+  ensureConfig: () => Promise<Config>;
+  loadConfig: () => Promise<Config>;
+  rotateApiKey: () => Promise<Config>;
   StorageFactory: () => StorageInstance;
   startServer: (opts: {
-    config: { apiKey: string; createdAt: string };
+    config: Config;
     storage: StorageInstance;
     port: number;
     host?: string;
     publicBaseUrl?: () => string | null;
   }) => Promise<ServerHandle>;
   ensureBinary: () => Promise<string>;
-  createTunnel: (opts: {
-    localPort: number;
-    binaryPath: string;
-  }) => Promise<TunnelHandle>;
+  createTunnel: (opts: TunnelStartOpts) => Promise<TunnelHandle>;
   installHook: (opts: {
     settingsPath: string;
     hookCommand: string;
@@ -134,6 +162,14 @@ export interface CliDeps {
   appendLog: (rec: object, path?: string, enabled?: boolean) => Promise<void>;
   readTail: (n: number, path?: string) => Promise<string[]>;
   followTail: (onLine: (line: string) => void, path?: string) => () => void;
+  /** v0.2: persist updated Config atomically. Used by configure-tunnel subcommand. */
+  saveConfig: (cfg: Config) => Promise<void>;
+  /** v0.2: update the tunnelUrl field in the PID file atomically (reconnect path). */
+  updatePidFileUrl: (url: string | null) => Promise<void>;
+  /** v0.2: delete the dedup cache file and reset in-memory state (reconnect path). */
+  purgeDedupCache: () => Promise<void>;
+  /** v0.2: start the edge healthcheck poll. Injectable for tests. */
+  startHealthcheck: (opts: HealthcheckOptions) => HealthcheckHandle;
 }
 
 // ── IO abstraction ────────────────────────────────────────────────────────────
@@ -191,6 +227,13 @@ export function defaultDeps(): CliDeps {
     appendLog: appendLogImpl as unknown as CliDeps['appendLog'],
     readTail: readTailImpl,
     followTail: followTailImpl,
+    saveConfig: saveConfigImpl,
+    updatePidFileUrl: updatePidFileUrlImpl,
+    purgeDedupCache: async () => {
+      const cache = new DedupCache(DEDUP_PATH);
+      await cache.purge();
+    },
+    startHealthcheck: startHealthcheckImpl,
   };
 }
 
@@ -232,9 +275,12 @@ export async function dispatch(
     case 'logs':
       return handleLogs(argv, deps, { ...io, stdout: out, stderr: err });
 
+    case 'configure-tunnel':
+      return handleConfigureTunnel(argv, deps, { stdout: out, stderr: err });
+
     default:
       err(`Unknown command: ${cmd}`);
-      err('Usage: claude-shotlink <start|stop|status|install-hook|uninstall-hook|rotate-key|logs>');
+      err('Usage: claude-shotlink <start|stop|status|install-hook|uninstall-hook|rotate-key|logs|configure-tunnel>');
       return 1;
   }
 }
@@ -252,6 +298,8 @@ export async function handleStart(
   // Parse flags
   let port = 0;
   let ttlSeconds: number | null = null;
+  let cliTunnelName: string | undefined;
+  let cliTunnelHostname: string | undefined;
 
   for (let i = 1; i < argv.length; i++) {
     const arg = argv[i]!;
@@ -269,7 +317,28 @@ export async function handleStart(
         return 1;
       }
       ttlSeconds = rawTtl;
+    } else if (arg === '--tunnel-name' && argv[i + 1]) {
+      cliTunnelName = argv[++i];
+    } else if (arg === '--tunnel-hostname' && argv[i + 1]) {
+      cliTunnelHostname = argv[++i];
     }
+  }
+
+  // Validate CLI tunnel flag completeness early (before any async ops)
+  if (cliTunnelName !== undefined && cliTunnelHostname === undefined) {
+    err('Both --tunnel-name and --tunnel-hostname are required for named mode. Missing: --tunnel-hostname');
+    return 1;
+  }
+  if (cliTunnelHostname !== undefined && cliTunnelName === undefined) {
+    err('Both --tunnel-name and --tunnel-hostname are required for named mode. Missing: --tunnel-name');
+    return 1;
+  }
+  // FIX-8: validate hostname shape immediately after parsing
+  if (cliTunnelHostname !== undefined && !HOSTNAME_RE.test(cliTunnelHostname)) {
+    err(
+      `Invalid --tunnel-hostname: "${cliTunnelHostname}" — expected a bare hostname (no scheme, no path), e.g. "shots.example.com".`,
+    );
+    return 1;
   }
 
   // Double-start guard
@@ -315,10 +384,38 @@ export async function handleStart(
     return 1;
   }
 
+  // Resolve tunnel mode: CLI flags > config > default 'quick'
+  let resolvedTunnelOpts: TunnelStartOpts['tunnel'];
+
+  if (cliTunnelName !== undefined && cliTunnelHostname !== undefined) {
+    // CLI flags win — named mode
+    resolvedTunnelOpts = { mode: 'named', name: cliTunnelName, hostname: cliTunnelHostname };
+  } else if (config.tunnelMode === 'named') {
+    // Config says named — validate completeness
+    if (!config.tunnelName || !config.tunnelHostname) {
+      err(
+        'Config has tunnelMode="named" but tunnelName or tunnelHostname is missing. ' +
+        'Run `claude-shotlink configure-tunnel` to fix.',
+      );
+      await server.close();
+      await storage.shutdown();
+      return 1;
+    }
+    resolvedTunnelOpts = {
+      mode: 'named',
+      name: config.tunnelName,
+      hostname: config.tunnelHostname,
+    };
+  } else {
+    // Default: quick mode
+    resolvedTunnelOpts = { mode: 'quick' };
+  }
+
   try {
     tunnelHandle = await deps.createTunnel({
       localPort: server.port,
       binaryPath,
+      tunnel: resolvedTunnelOpts,
     });
   } catch (e) {
     err(`Failed to start tunnel: ${String(e)}`);
@@ -343,11 +440,166 @@ export async function handleStart(
   out(`  tunnel:  ${tunnelUrl}`);
   out(`  key:     ${config.apiKey}`);
 
-  // Notify test harness that startup is complete
+  // ── State machine (initialized before onServerReady so tests can trigger it) ─
+  const exitFn = io.exitFn ?? ((code: number) => process.exit(code));
+  // Reads go through `getState()` so TS does not narrow across awaits —
+  // `shutdown()` may mutate `_state` concurrently when SIGTERM races with
+  // `onHealthcheckFail`. Function-call returns block control-flow narrowing.
+  let _state: RelayState = 'running';
+  const getState = (): RelayState => _state;
+  // Used to resolve the await-forever promise. Initialized here so that
+  // signal handlers registered before onServerReady can resolve it even
+  // if the SIGTERM fires synchronously inside onServerReady.
+  let resolveShutdown: (() => void) | null = null;
+  const shutdownPromise = new Promise<void>((resolve) => {
+    resolveShutdown = resolve;
+  });
+
+  // ── Healthcheck setup ─────────────────────────────────────────────────────
+  const QUICK_GRACE = 5_000;
+  const NAMED_GRACE = 15_000;
+  const FAIL_THRESHOLD = 3;
+  const POLL_MS = 30_000;
+
+  const resolvedMode = resolvedTunnelOpts?.mode ?? 'quick';
+
+  let healthcheck: HealthcheckHandle | null = null;
+
+  const startHc = (publicUrl: string): HealthcheckHandle => {
+    return deps.startHealthcheck({
+      publicUrl,
+      graceMs: resolvedMode === 'named' ? NAMED_GRACE : QUICK_GRACE,
+      intervalMs: POLL_MS,
+      failThreshold: FAIL_THRESHOLD,
+      onFail: () => void onHealthcheckFail(),
+    });
+  };
+
+  // ── Reconnect handler ─────────────────────────────────────────────────────
+  const onHealthcheckFail = async (): Promise<void> => {
+    if (getState() !== 'running') return;
+
+    if (resolvedMode === 'named') {
+      // Named mode: warn only — hostname is stable, don't respawn
+      err(
+        `[healthcheck] ${FAIL_THRESHOLD} consecutive failures pinging ${tunnelHandle!.publicUrl}/health — ` +
+        `Cloudflare edge unreachable. Hostname is stable; not restarting. Investigate DNS / tunnel status.`,
+      );
+      return;
+    }
+
+    // Quick mode: reconnect
+    _state = 'reconnecting';
+    err('[healthcheck] Quick tunnel unhealthy; reconnecting…');
+    healthcheck?.stop();
+
+    const oldHandle = tunnelHandle!;
+    // Capture last known URL BEFORE stopping (stop() sets publicUrl → null)
+    const lastKnownUrl = oldHandle.publicUrl;
+    try {
+      await oldHandle.stop();
+    } catch {
+      // best effort — cloudflared may already be dead
+    }
+
+    if (getState() === 'shuttingDown') return;
+
+    let newHandle: TunnelHandle;
+    try {
+      newHandle = await deps.createTunnel({
+        localPort: server.port,
+        binaryPath,
+        tunnel: { mode: 'quick' },
+      });
+    } catch (e) {
+      // SIGTERM raced us during createTunnel — abandon, do not start a new healthcheck
+      if (getState() === 'shuttingDown') return;
+      err(`[healthcheck] Reconnect failed: ${String(e)}`);
+      // Stay alive; retry on next healthcheck cycle.
+      // Restart healthcheck unconditionally — if no URL, next ping fails and re-triggers.
+      if (getState() === 'reconnecting') _state = 'running';
+      const urlForHc = lastKnownUrl ?? tunnelHandle?.publicUrl;
+      if (urlForHc) {
+        healthcheck = startHc(urlForHc);
+      } else {
+        // No URL available — still restart with a placeholder so reconnect cycles continue
+        healthcheck = startHc('http://127.0.0.1');
+      }
+      return;
+    }
+
+    if (getState() === 'shuttingDown') {
+      await newHandle.stop().catch(() => {});
+      return;
+    }
+
+    tunnelHandle = newHandle;
+    // FIX-9: use null (not '') when no URL — matches PidMeta.tunnelUrl: string | null
+    await deps.updatePidFileUrl(newHandle.publicUrl ?? null).catch((e) =>
+      err(`[healthcheck] PID update failed: ${String(e)}`),
+    );
+    await deps.purgeDedupCache().catch(() => { /* benign */ });
+    // SIGTERM may have raced us during PID/dedup awaits — re-check before
+    // restoring 'running' state and starting a new healthcheck
+    if (getState() === 'shuttingDown') {
+      await newHandle.stop().catch(() => {});
+      return;
+    }
+    out(`[healthcheck] reconnected: ${newHandle.publicUrl}`);
+    _state = 'running';
+    if (newHandle.publicUrl) {
+      healthcheck = startHc(newHandle.publicUrl);
+    }
+  };
+
+  // ── Shutdown function ─────────────────────────────────────────────────────
+  const shutdown = async (): Promise<void> => {
+    if (getState() === 'shuttingDown') return;
+    _state = 'shuttingDown';
+    healthcheck?.stop();
+    try {
+      await server.close();
+    } catch { /* best effort */ }
+    try {
+      await tunnelHandle!.stop();
+    } catch { /* best effort */ }
+    try {
+      await storage.shutdown();
+    } catch { /* best effort */ }
+    try {
+      await deps.deletePidFile();
+    } catch { /* best effort */ }
+    resolveShutdown?.();
+    exitFn(0);
+  };
+
+  // ── Start healthcheck (after tunnel up and PID written) ───────────────────
+  if (tunnelHandle.publicUrl) {
+    healthcheck = startHc(tunnelHandle.publicUrl);
+  }
+
+  // ── TTL shutdown timer ────────────────────────────────────────────────────
+  if (ttlSeconds !== null) {
+    setTimeout(() => void shutdown(), ttlSeconds * 1000);
+  }
+
+  // ── Signal handlers — registered BEFORE onServerReady so tests can emit signals ──
+  const sigintHandler = (): void => void shutdown();
+  const sigtermHandler = (): void => void shutdown();
+  process.on('SIGINT', sigintHandler);
+  process.on('SIGTERM', sigtermHandler);
+
+  // ── Notify test harness that startup is complete ──────────────────────────
+  // NOTE: Called AFTER state machine is initialized (including signal handlers)
+  // so onServerReady callbacks can trigger reconnects, shutdowns, etc. without
+  // race conditions.
   io.onServerReady?.();
 
   if (io.abortAfterReady) {
-    // Test mode: clean up and exit
+    // Test mode: clean up and exit — remove signal handlers before returning
+    process.off('SIGINT', sigintHandler);
+    process.off('SIGTERM', sigtermHandler);
+    healthcheck?.stop();
     await server.close();
     await tunnelHandle.stop();
     await storage.shutdown();
@@ -355,38 +607,8 @@ export async function handleStart(
     return 0;
   }
 
-  // ── Shutdown function ─────────────────────────────────────────────────────
-  const exitFn = io.exitFn ?? ((code: number) => process.exit(code));
-  let shuttingDown = false;
-  // Used to resolve the await-forever promise in test scenarios
-  let resolveShutdown: (() => void) | null = null;
-
-  const shutdown = async (): Promise<void> => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    await server.close();
-    await tunnelHandle!.stop();
-    await storage.shutdown();
-    await deps.deletePidFile();
-    resolveShutdown?.();
-    exitFn(0);
-  };
-
-  // ── TTL shutdown timer ────────────────────────────────────────────────────
-  if (ttlSeconds !== null) {
-    setTimeout(() => void shutdown(), ttlSeconds * 1000);
-  }
-
-  // ── Signal handlers ────────────────────────────────────────────────────────
-  const sigintHandler = (): void => void shutdown();
-  const sigtermHandler = (): void => void shutdown();
-  process.on('SIGINT', sigintHandler);
-  process.on('SIGTERM', sigtermHandler);
-
   // ── Await forever (until signal, TTL, or shutdown completes) ──────────────
-  await new Promise<void>((resolve) => {
-    resolveShutdown = resolve;
-  });
+  await shutdownPromise;
 
   // Clean up signal handlers to avoid leaking
   process.off('SIGINT', sigintHandler);
@@ -609,6 +831,95 @@ export async function handleRotateKey(
   const config = await deps.rotateApiKey();
   io.stdout(config.apiKey);
   io.stderr('Restart the relay to apply the new key.');
+  return 0;
+}
+
+// ── handleConfigureTunnel ─────────────────────────────────────────────────────
+
+/**
+ * `configure-tunnel` subcommand handler.
+ *
+ * Accepts:
+ *   --mode <quick|named>
+ *   --name <name>        (required when --mode named)
+ *   --hostname <host>    (required when --mode named)
+ *
+ * Reads existing config, merges the tunnel fields, and atomically writes
+ * the result back. Exits 0 on success, 1 on validation failure.
+ * Does NOT start any tunnel.
+ */
+export async function handleConfigureTunnel(
+  argv: string[],
+  deps: CliDeps,
+  io: { stdout: (s: string) => void; stderr: (s: string) => void },
+): Promise<number> {
+  let mode: 'quick' | 'named' | undefined;
+  let name: string | undefined;
+  let hostname: string | undefined;
+
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a === '--mode' && argv[i + 1]) {
+      const m = argv[++i];
+      if (m !== 'quick' && m !== 'named') {
+        io.stderr(`Invalid --mode: "${m}" (expected "quick" or "named")`);
+        return 1;
+      }
+      mode = m;
+    } else if (a === '--name' && argv[i + 1]) {
+      name = argv[++i];
+    } else if (a === '--hostname' && argv[i + 1]) {
+      hostname = argv[++i];
+    }
+  }
+
+  if (mode === undefined) {
+    io.stderr('Missing required --mode flag (expected "quick" or "named").');
+    return 1;
+  }
+
+  if (mode === 'named') {
+    if (!name && !hostname) {
+      io.stderr('--mode named requires both --name and --hostname.');
+      return 1;
+    }
+    if (!name) {
+      io.stderr('--mode named requires --name <tunnel-name>.');
+      return 1;
+    }
+    if (!hostname) {
+      io.stderr('--mode named requires --hostname <hostname>.');
+      return 1;
+    }
+    // Validate hostname shape: no scheme, no path (FIX-3)
+    if (!HOSTNAME_RE.test(hostname)) {
+      io.stderr(
+        `Invalid --hostname: "${hostname}" — expected a bare hostname (no scheme, no path), e.g. "shots.example.com".`,
+      );
+      return 1;
+    }
+  }
+
+  // Read existing config → merge → write
+  const existing = await deps.ensureConfig();
+  const next: Config = { ...existing, tunnelMode: mode };
+
+  if (mode === 'named') {
+    next.tunnelName = name;
+    next.tunnelHostname = hostname;
+  } else {
+    // quick mode: clear the named-only fields
+    delete next.tunnelName;
+    delete next.tunnelHostname;
+  }
+
+  await deps.saveConfig(next);
+
+  const summary =
+    mode === 'named'
+      ? `mode=named name=${name} hostname=${hostname}`
+      : 'mode=quick';
+  io.stdout(`Tunnel configured: ${summary}`);
   return 0;
 }
 

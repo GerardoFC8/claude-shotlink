@@ -142,6 +142,68 @@ describe('DedupCache', () => {
   });
 });
 
+// ── TASK-015: DedupCache.purge() + DEDUP_PATH export ────────────────────────
+
+describe('DedupCache.purge() — TASK-015', () => {
+  let tempDir: string;
+  let cachePath: string;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'dedup-purge-test-'));
+    cachePath = join(tempDir, 'dedup.json');
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('purge() deletes the dedup.json file from disk', async () => {
+    const { DedupCache } = await import('./dedup-cache.js');
+    const cache = new DedupCache(cachePath);
+    await cache.load();
+    cache.remember('sha1', 'https://url1');
+    await cache.flush();
+
+    expect(existsSync(cachePath)).toBe(true);
+
+    await cache.purge();
+
+    expect(existsSync(cachePath)).toBe(false);
+  });
+
+  it('purge() on absent file is silent (no throw)', async () => {
+    const { DedupCache } = await import('./dedup-cache.js');
+    const cache = new DedupCache(cachePath);
+    // File never written — purge should be a no-op
+    await expect(cache.purge()).resolves.toBeUndefined();
+  });
+
+  it('after purge(), subsequent load() returns empty cache', async () => {
+    const { DedupCache } = await import('./dedup-cache.js');
+    const cache = new DedupCache(cachePath);
+    await cache.load();
+    cache.remember('sha1', 'https://url1');
+    await cache.flush();
+
+    await cache.purge();
+
+    // In-memory map should be cleared immediately
+    expect(cache.lookup('sha1')).toBeNull();
+
+    // A fresh instance loading from disk should also be empty
+    const cache2 = new DedupCache(cachePath);
+    await cache2.load();
+    expect(cache2.lookup('sha1')).toBeNull();
+  });
+
+  it('DEDUP_PATH is exported from dedup-cache.ts', async () => {
+    const { DEDUP_PATH } = await import('./dedup-cache.js');
+    expect(typeof DEDUP_PATH).toBe('string');
+    expect(DEDUP_PATH).toContain('.claude-shotlink');
+    expect(DEDUP_PATH).toMatch(/dedup\.json$/);
+  });
+});
+
 // ── SUSPECT-3 regression: flush is atomic (no .tmp files left behind) ─────────
 
 describe('DedupCache — SUSPECT-3: flush is atomic', () => {

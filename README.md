@@ -2,7 +2,7 @@
 
 Auto-upload Claude Code screenshots to a temporary public URL so you can review them from any device when using Remote Control.
 
-> **Status**: v0.1 — early development, macOS / Linux / WSL2.
+> **Status**: v0.2 — macOS / Linux / WSL2.
 
 ## Why
 
@@ -12,10 +12,26 @@ When you control Claude Code remotely (phone, tablet, another machine) and ask i
 
 ---
 
+## Install
+
+Recommended — global install keeps the binary on your `$PATH`:
+
+```bash
+npm i -g @gerardofc/claude-shotlink@latest
+```
+
+Or run without installing (always pulls the latest published version):
+
+```bash
+npx @gerardofc/claude-shotlink@latest start
+```
+
+If you already have an older version installed globally, the command above upgrades it in place.
+
 ## Quickstart
 
 ```bash
-npx @gerardofc/claude-shotlink start
+claude-shotlink start
 ```
 
 On first run this will:
@@ -88,11 +104,112 @@ Backups are written to `~/.claude/settings.json.backup-<ISO8601>` before every m
 - `--port <n>` — listen on a specific port instead of an OS-assigned one.
 - `--ttl <seconds>` — automatically shut down after this many seconds.
 
-> `--no-hook` (skip hook install) and `--log` (opt-in JSONL upload logging) are planned for a post-v0.1 release.
+> `--no-hook` (skip hook install) and `--log` (opt-in JSONL upload logging) are planned for a future release.
+
+---
+
+## Persistent URLs with named tunnel
+
+By default, `claude-shotlink` uses a Cloudflare **quick tunnel** — a free, anonymous tunnel that requires no account. The downside is that the public URL changes every time the relay restarts or auto-reconnects after a Cloudflare edge failure.
+
+If you need a **stable, permanent hostname** (so Claude Code conversation context, bookmarks, and webhooks keep working across restarts), you can opt into a named tunnel backed by your own Cloudflare account.
+
+### Prerequisites
+
+1. **Cloudflare account** — sign up free at [dash.cloudflare.com](https://dash.cloudflare.com).
+2. **Domain on Cloudflare** — you need at least one domain whose DNS is managed by Cloudflare (nameservers pointed at Cloudflare). The hostname you pick (e.g. `shots.example.com`) must be on that domain.
+3. **Authenticate `cloudflared`** — run the command below to open a browser window and link your Cloudflare account to the local `cloudflared` binary:
+
+   ```bash
+   cloudflared tunnel login
+   ```
+
+4. **Create a named tunnel** — this saves a credentials JSON file to `~/.cloudflared/`:
+
+   ```bash
+   cloudflared tunnel create <name>
+   ```
+
+   Replace `<name>` with any slug you like (e.g. `shotlink`). Note it — you will use it in the next steps.
+
+5. **Route a hostname to the tunnel** — create the DNS CNAME record that points your chosen hostname at the tunnel:
+
+   ```bash
+   cloudflared tunnel route dns <name> <hostname>
+   ```
+
+   Example: `cloudflared tunnel route dns shotlink shots.example.com`
+
+### Configure the relay to use named mode
+
+Run `configure-tunnel` once to persist the named-tunnel settings:
+
+```bash
+claude-shotlink configure-tunnel --mode named --name <name> --hostname <hostname>
+```
+
+Example:
+
+```bash
+claude-shotlink configure-tunnel --mode named --name shotlink --hostname shots.example.com
+```
+
+This writes `tunnelMode`, `tunnelName`, and `tunnelHostname` to `~/.claude-shotlink/config.json`. It does **not** start the tunnel.
+
+### Important: ingress port must match
+
+Your named tunnel's ingress must point at the same port the relay is listening on. In your Cloudflare tunnel config (either `~/.cloudflared/config.yml` or the Cloudflare dashboard), ensure the ingress rule is:
+
+```
+http://127.0.0.1:<port>
+```
+
+where `<port>` is the relay's port (shown in `claude-shotlink status`, or set via `--port`). **This is the most common misconfiguration** — if the ingress port does not match the relay port, the tunnel comes up but all requests fail with Error 1033 on the Cloudflare edge.
+
+### Start in named mode
+
+```bash
+claude-shotlink start
+```
+
+No extra flags needed — the relay reads the saved config and starts cloudflared in named mode automatically. The public URL printed at startup is your permanent hostname (`https://shots.example.com`). It will remain the same across restarts.
+
+To override for a single session without changing the config:
+
+```bash
+claude-shotlink start --tunnel-name <name> --tunnel-hostname <hostname>
+```
+
+### Revert to quick mode
+
+```bash
+claude-shotlink configure-tunnel --mode quick
+claude-shotlink start
+```
+
+---
+
+## Known limitations
+
+- **Quick tunnel URLs change on reconnect.** The default quick-tunnel mode issues a new random URL every time the relay restarts and every time the Cloudflare edge drops the connection and the relay auto-reconnects. Anything that pinned the previous URL — Claude Code conversation context, bookmarks, or external services — will break and need the new URL.
+
+- **Named tunnels require a Cloudflare account and a domain.** You must have a Cloudflare account and at least one domain whose DNS is managed by Cloudflare. Named tunnels are not available to users without these prerequisites. See the [Persistent URLs with named tunnel](#persistent-urls-with-named-tunnel) section for the full setup.
 
 ---
 
 ## Troubleshooting
+
+**Error 1033 — Cloudflare edge cannot reach origin**
+
+Cloudflare returns HTTP Error 1033 when its edge cannot reach the local relay through the tunnel.
+
+- **In quick mode:** the quick-tunnel registration drifted or went stale. Starting in v0.2, the relay detects 3 consecutive `/health` failures and automatically reconnects, issuing a new tunnel URL. Your old URL is dead; the new URL appears in the relay output. Update anything that referenced the previous URL.
+
+- **In named mode:** Cloudflare can reach the tunnel but not the relay's HTTP port. The most likely cause is an ingress port mismatch — the tunnel's ingress config points at a different port than the one the relay is listening on. Check that your Cloudflare tunnel ingress is set to `http://127.0.0.1:<port>` matching the relay's actual port (`claude-shotlink status`).
+
+- **Permanent fix:** switch to named mode for a stable hostname that survives reconnects. See [Persistent URLs with named tunnel](#persistent-urls-with-named-tunnel).
+
+---
 
 **Relay not running / `status` shows unreachable**
 

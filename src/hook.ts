@@ -20,6 +20,7 @@ import type { HookDeps, PidMetaMin } from './hook-core.js';
 import { readPidFile } from './pid.js';
 import { loadConfig } from './config.js';
 import { DedupCache } from './dedup-cache.js';
+import { SCREENSHOT_DIR_RE, SCREENSHOT_EXT_RE } from './hook-detect.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -79,10 +80,6 @@ function buildRealDeps(): HookDeps {
       async walk(roots, opts) {
         // Real FsScan using fs.opendir recursion
         const { readdir, stat } = await import('node:fs/promises');
-        const SCREENSHOT_EXT_RE = /\.(png|jpe?g|webp)$/i;
-        const SCREENSHOT_DIR_RE =
-          /(^|\/)(test-results|screenshots|\.playwright|playwright-report)(\/|$)/i;
-
         const results: Array<{ absPath: string; source: 'bash-scan'; mtimeMs: number }> = [];
         const deadline = Date.now() + opts.timeoutMs;
 

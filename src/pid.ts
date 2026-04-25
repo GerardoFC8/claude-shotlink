@@ -94,6 +94,56 @@ export async function readPidFile(path: string = PID_PATH): Promise<PidMeta | nu
   return meta;
 }
 
+// ── Update URL ────────────────────────────────────────────────────────────────
+
+/**
+ * Read the PID file without performing a stale-PID check.
+ * Used internally by updatePidFileUrl so we can read our own process's PID file
+ * (we ARE that process, so alive-checking would be a no-op but let's skip the
+ * side-effects entirely).
+ *
+ * @param path  Override path (useful in tests). Defaults to PID_PATH.
+ */
+async function readPidFileRaw(path: string = PID_PATH): Promise<PidMeta | null> {
+  let raw: string;
+  try {
+    raw = await readFile(path, 'utf8');
+  } catch {
+    return null;
+  }
+
+  let meta: unknown;
+  try {
+    meta = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+
+  if (!isPidMeta(meta)) {
+    return null;
+  }
+
+  return meta;
+}
+
+/**
+ * Atomically update the `tunnelUrl` field in the PID file.
+ * All other fields (pid, port, startedAt) are preserved.
+ * Throws if the PID file does not exist.
+ *
+ * Used by the quick-mode reconnect path when a new tunnel URL is established.
+ *
+ * @param newUrl  The new public tunnel URL, or null when no URL is available.
+ * @param path    Override path (useful in tests). Defaults to PID_PATH.
+ */
+export async function updatePidFileUrl(newUrl: string | null, path: string = PID_PATH): Promise<void> {
+  const meta = await readPidFileRaw(path);
+  if (meta === null) {
+    throw new Error(`Cannot update tunnelUrl: PID file not found at ${path}`);
+  }
+  await writePidFile({ ...meta, tunnelUrl: newUrl }, path);
+}
+
 // ── Delete ────────────────────────────────────────────────────────────────────
 
 /**

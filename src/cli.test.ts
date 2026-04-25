@@ -66,6 +66,10 @@ function buildFakeDeps(overrides: Record<string, any> = {}): CliDeps {
     appendLog: vi.fn().mockResolvedValue(undefined),
     readTail: vi.fn().mockResolvedValue([]),
     followTail: vi.fn().mockReturnValue(() => {}),
+    saveConfig: vi.fn().mockResolvedValue(undefined),
+    updatePidFileUrl: vi.fn().mockResolvedValue(undefined),
+    purgeDedupCache: vi.fn().mockResolvedValue(undefined),
+    startHealthcheck: vi.fn().mockReturnValue({ stop: vi.fn(), failCount: 0, stopped: false }),
   };
 
   return { ...defaults, ...overrides } as unknown as CliDeps;
@@ -904,6 +908,257 @@ describe('handleStart -- invalid --ttl flag', () => {
   });
 });
 
+// ── B3: TASK-009-a RED — handleStart --tunnel-name/--tunnel-hostname flag parsing ──
+
+describe('handleStart — TASK-009: tunnel mode flag parsing + precedence', () => {
+  it('named mode: --tunnel-name + --tunnel-hostname → createTunnel called with named mode', async () => {
+    const { handleStart } = await import('./cli.js');
+
+    const createTunnelMock = vi.fn().mockResolvedValue({
+      publicUrl: 'https://shots.example.com',
+      stop: vi.fn().mockResolvedValue(undefined),
+      onUrlReady: vi.fn().mockReturnValue(() => {}),
+      onDrop: vi.fn().mockReturnValue(() => {}),
+    });
+
+    const deps = buildFakeDeps({
+      readPidFile: vi.fn().mockResolvedValue(null),
+      ensureConfig: vi.fn().mockResolvedValue({
+        apiKey: 'sk_' + 'a'.repeat(64),
+        createdAt: new Date().toISOString(),
+      }),
+      createTunnel: createTunnelMock,
+    });
+
+    let resolveReady: (() => void) | undefined;
+    const readyPromise = new Promise<void>((r) => { resolveReady = r; });
+
+    const startPromise = handleStart(
+      ['start', '--tunnel-name', 'my-tunnel', '--tunnel-hostname', 'shots.example.com'],
+      deps,
+      {
+        stdout: () => {},
+        stderr: () => {},
+        onServerReady: () => { resolveReady?.(); },
+        abortAfterReady: true,
+      },
+    );
+
+    await readyPromise;
+    await new Promise<void>((r) => setTimeout(r, 10));
+
+    expect(createTunnelMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tunnel: { mode: 'named', name: 'my-tunnel', hostname: 'shots.example.com' },
+      }),
+    );
+
+    await startPromise.catch(() => {});
+  });
+
+  it('exits 1 when --tunnel-hostname is given without --tunnel-name', async () => {
+    const { handleStart } = await import('./cli.js');
+
+    const deps = buildFakeDeps({
+      readPidFile: vi.fn().mockResolvedValue(null),
+      ensureConfig: vi.fn().mockResolvedValue({
+        apiKey: 'sk_' + 'a'.repeat(64),
+        createdAt: new Date().toISOString(),
+      }),
+    });
+
+    const stderrLines: string[] = [];
+    const code = await handleStart(
+      ['start', '--tunnel-hostname', 'shots.example.com'],
+      deps,
+      { stdout: () => {}, stderr: (s) => stderrLines.push(s) },
+    );
+
+    expect(code).toBe(1);
+    expect(stderrLines.join('')).toMatch(/tunnel-name/i);
+  });
+
+  it('exits 1 when --tunnel-name is given without --tunnel-hostname', async () => {
+    const { handleStart } = await import('./cli.js');
+
+    const deps = buildFakeDeps({
+      readPidFile: vi.fn().mockResolvedValue(null),
+      ensureConfig: vi.fn().mockResolvedValue({
+        apiKey: 'sk_' + 'a'.repeat(64),
+        createdAt: new Date().toISOString(),
+      }),
+    });
+
+    const stderrLines: string[] = [];
+    const code = await handleStart(
+      ['start', '--tunnel-name', 'my-tunnel'],
+      deps,
+      { stdout: () => {}, stderr: (s) => stderrLines.push(s) },
+    );
+
+    expect(code).toBe(1);
+    expect(stderrLines.join('')).toMatch(/tunnel-hostname/i);
+  });
+
+  it('config named mode with no CLI flags → createTunnel called with named mode from config', async () => {
+    const { handleStart } = await import('./cli.js');
+
+    const createTunnelMock = vi.fn().mockResolvedValue({
+      publicUrl: 'https://h.example.com',
+      stop: vi.fn().mockResolvedValue(undefined),
+      onUrlReady: vi.fn().mockReturnValue(() => {}),
+      onDrop: vi.fn().mockReturnValue(() => {}),
+    });
+
+    const deps = buildFakeDeps({
+      readPidFile: vi.fn().mockResolvedValue(null),
+      ensureConfig: vi.fn().mockResolvedValue({
+        apiKey: 'sk_' + 'a'.repeat(64),
+        createdAt: new Date().toISOString(),
+        tunnelMode: 'named' as const,
+        tunnelName: 'cfg-tunnel',
+        tunnelHostname: 'h.example.com',
+      }),
+      createTunnel: createTunnelMock,
+    });
+
+    let resolveReady: (() => void) | undefined;
+    const readyPromise = new Promise<void>((r) => { resolveReady = r; });
+
+    const startPromise = handleStart(['start'], deps, {
+      stdout: () => {},
+      stderr: () => {},
+      onServerReady: () => { resolveReady?.(); },
+      abortAfterReady: true,
+    });
+
+    await readyPromise;
+    await new Promise<void>((r) => setTimeout(r, 10));
+
+    expect(createTunnelMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tunnel: { mode: 'named', name: 'cfg-tunnel', hostname: 'h.example.com' },
+      }),
+    );
+
+    await startPromise.catch(() => {});
+  });
+
+  it('CLI --tunnel-hostname overrides config hostname for this invocation', async () => {
+    const { handleStart } = await import('./cli.js');
+
+    const createTunnelMock = vi.fn().mockResolvedValue({
+      publicUrl: 'https://override.example.com',
+      stop: vi.fn().mockResolvedValue(undefined),
+      onUrlReady: vi.fn().mockReturnValue(() => {}),
+      onDrop: vi.fn().mockReturnValue(() => {}),
+    });
+
+    const deps = buildFakeDeps({
+      readPidFile: vi.fn().mockResolvedValue(null),
+      ensureConfig: vi.fn().mockResolvedValue({
+        apiKey: 'sk_' + 'a'.repeat(64),
+        createdAt: new Date().toISOString(),
+        tunnelMode: 'named' as const,
+        tunnelName: 'cfg-tunnel',
+        tunnelHostname: 'old.example.com',
+      }),
+      createTunnel: createTunnelMock,
+    });
+
+    let resolveReady: (() => void) | undefined;
+    const readyPromise = new Promise<void>((r) => { resolveReady = r; });
+
+    const startPromise = handleStart(
+      ['start', '--tunnel-name', 'cfg-tunnel', '--tunnel-hostname', 'override.example.com'],
+      deps,
+      {
+        stdout: () => {},
+        stderr: () => {},
+        onServerReady: () => { resolveReady?.(); },
+        abortAfterReady: true,
+      },
+    );
+
+    await readyPromise;
+    await new Promise<void>((r) => setTimeout(r, 10));
+
+    expect(createTunnelMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tunnel: { mode: 'named', name: 'cfg-tunnel', hostname: 'override.example.com' },
+      }),
+    );
+
+    await startPromise.catch(() => {});
+  });
+
+  it('exits 1 when config has tunnelMode=named but tunnelHostname is missing', async () => {
+    const { handleStart } = await import('./cli.js');
+
+    const deps = buildFakeDeps({
+      readPidFile: vi.fn().mockResolvedValue(null),
+      ensureConfig: vi.fn().mockResolvedValue({
+        apiKey: 'sk_' + 'a'.repeat(64),
+        createdAt: new Date().toISOString(),
+        tunnelMode: 'named' as const,
+        tunnelName: 'T',
+        // tunnelHostname intentionally absent
+      }),
+    });
+
+    const stderrLines: string[] = [];
+    const code = await handleStart(['start'], deps, {
+      stdout: () => {},
+      stderr: (s) => stderrLines.push(s),
+    });
+
+    expect(code).toBe(1);
+    expect(stderrLines.join('')).toMatch(/hostname/i);
+  });
+
+  it('no config tunnel fields + no flags → quick mode (v0.1 behavior)', async () => {
+    const { handleStart } = await import('./cli.js');
+
+    const createTunnelMock = vi.fn().mockResolvedValue({
+      publicUrl: 'https://quick.trycloudflare.com',
+      stop: vi.fn().mockResolvedValue(undefined),
+      onUrlReady: vi.fn().mockReturnValue(() => {}),
+      onDrop: vi.fn().mockReturnValue(() => {}),
+    });
+
+    const deps = buildFakeDeps({
+      readPidFile: vi.fn().mockResolvedValue(null),
+      ensureConfig: vi.fn().mockResolvedValue({
+        apiKey: 'sk_' + 'a'.repeat(64),
+        createdAt: new Date().toISOString(),
+        // No tunnel fields
+      }),
+      createTunnel: createTunnelMock,
+    });
+
+    let resolveReady: (() => void) | undefined;
+    const readyPromise = new Promise<void>((r) => { resolveReady = r; });
+
+    const startPromise = handleStart(['start'], deps, {
+      stdout: () => {},
+      stderr: () => {},
+      onServerReady: () => { resolveReady?.(); },
+      abortAfterReady: true,
+    });
+
+    await readyPromise;
+    await new Promise<void>((r) => setTimeout(r, 10));
+
+    expect(createTunnelMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tunnel: { mode: 'quick' },
+      }),
+    );
+
+    await startPromise.catch(() => {});
+  });
+});
+
 // ── WARNING-2 regression: isMain guard not too broad ─────────────────────────
 
 describe('isMain guard — no broad .ts suffix match', () => {
@@ -1153,5 +1408,63 @@ describe('loadConfig — FIX-6: functional test throws on corrupt JSON', () => {
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
+  });
+});
+
+// ── FIX-8: --tunnel-hostname validated in handleStart ────────────────────────
+
+describe('handleStart — FIX-8: --tunnel-hostname validation', () => {
+  beforeEach(() => {
+    process.removeAllListeners('SIGTERM');
+    process.removeAllListeners('SIGINT');
+  });
+
+  it('FIX-8: exits 1 + stderr contains hostname validation message when --tunnel-hostname has scheme', async () => {
+    const { handleStart } = await import('./cli.js');
+    const deps = buildFakeDeps();
+    const stderrLines: string[] = [];
+
+    const code = await handleStart(
+      ['start', '--tunnel-name', 'my-tunnel', '--tunnel-hostname', 'http://x.com'],
+      deps,
+      { stderr: (s) => stderrLines.push(s), stdout: () => {}, exitFn: () => {} },
+    );
+
+    expect(code).toBe(1);
+    expect(stderrLines.join('')).toMatch(/hostname/i);
+  });
+
+  it('FIX-8: exits 1 + stderr contains hostname validation message when --tunnel-hostname has fragment', async () => {
+    const { handleStart } = await import('./cli.js');
+    const deps = buildFakeDeps();
+    const stderrLines: string[] = [];
+
+    const code = await handleStart(
+      ['start', '--tunnel-name', 'my-tunnel', '--tunnel-hostname', 'x.com#fragment'],
+      deps,
+      { stderr: (s) => stderrLines.push(s), stdout: () => {}, exitFn: () => {} },
+    );
+
+    expect(code).toBe(1);
+    expect(stderrLines.join('')).toMatch(/hostname/i);
+  });
+
+  it('FIX-8: valid bare hostname passes and proceeds to ensureBinary', async () => {
+    const { handleStart } = await import('./cli.js');
+    const ensureBinary = vi.fn().mockRejectedValue(new Error('stop here'));
+    const deps = buildFakeDeps({ ensureBinary });
+
+    const stderrLines: string[] = [];
+    const code = await handleStart(
+      ['start', '--tunnel-name', 'my-tunnel', '--tunnel-hostname', 'shots.example.com'],
+      deps,
+      { stderr: (s) => stderrLines.push(s), stdout: () => {}, exitFn: () => {} },
+    );
+
+    // ensureBinary throws → exit 1, but for a different reason — hostname was accepted
+    expect(code).toBe(1);
+    expect(ensureBinary).toHaveBeenCalled();
+    // Error should be about binary, not hostname
+    expect(stderrLines.join('')).not.toMatch(/invalid.*hostname/i);
   });
 });

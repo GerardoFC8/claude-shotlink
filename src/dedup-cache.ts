@@ -13,7 +13,9 @@
  *
  * File permissions: 0o600.
  */
-import { readFile } from 'node:fs/promises';
+import { readFile, unlink } from 'node:fs/promises';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { writeAtomic } from './atomic-write.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -21,6 +23,13 @@ import { writeAtomic } from './atomic-write.js';
 const TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const MAX_ENTRIES = 500;
 const FILE_VERSION = 1;
+
+/**
+ * Default absolute path to the dedup cache file.
+ * Exported so callers (e.g., the reconnect path in cli.ts) can reference it
+ * without constructing the path themselves.
+ */
+export const DEDUP_PATH: string = join(homedir(), '.claude-shotlink', 'dedup.json');
 
 // ── Disk shape ────────────────────────────────────────────────────────────────
 
@@ -95,6 +104,26 @@ export class DedupCache {
   /** Record a new sha256 → URL mapping in memory. Call `flush()` to persist. */
   remember(sha: string, url: string): void {
     this.map.set(sha, { url, at: Date.now() });
+  }
+
+  /**
+   * Delete the on-disk cache file and reset the in-memory map.
+   * Used by the quick-mode reconnect path to invalidate the cache when a new
+   * tunnel URL is established (old URLs will generate duplicate dedup hits).
+   *
+   * Safe to call when the file does not exist — no-ops silently.
+   */
+  async purge(): Promise<void> {
+    // Reset in-memory map immediately
+    this.map = new Map();
+
+    // Delete file — ignore ENOENT (not present is fine)
+    try {
+      await unlink(this.filePath);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT') throw err;
+    }
   }
 
   /** Persist the current in-memory cache to disk using an atomic write (mode 0o600). */
