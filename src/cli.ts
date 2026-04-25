@@ -496,10 +496,14 @@ export async function handleStart(
         return 1;
       }
       const credsObj = (credsParsed !== null && typeof credsParsed === 'object') ? credsParsed as Record<string, unknown> : {};
-      if (typeof credsObj['TunnelID'] !== 'string' || typeof credsObj['TunnelName'] !== 'string') {
+      // v0.3.1 fix: cloudflared writes credentials JSON with TunnelID + TunnelSecret +
+      // AccountTag + Endpoint — NO TunnelName field. Earlier we required TunnelName
+      // (based on a wrong assumption about the file shape) and rejected every real
+      // credentials file. Now we only require TunnelID, which IS in real files.
+      if (typeof credsObj['TunnelID'] !== 'string') {
         err(
-          `Credentials file at '${config.tunnelCredentialsFile}' is missing required fields ` +
-          `(TunnelID and TunnelName). Re-run setup-tunnel to recreate.`,
+          `Credentials file at '${config.tunnelCredentialsFile}' is missing required field 'TunnelID'. ` +
+          `Re-run setup-tunnel to recreate.`,
         );
         await server.close();
         await storage.shutdown();

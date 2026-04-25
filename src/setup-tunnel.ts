@@ -144,45 +144,44 @@ export function parseTunnelCreateOutput(stdout: string): { uuid: string; credent
 }
 
 /**
- * Scan `~/.cloudflared/*.json` for a file whose `TunnelName` matches `name`.
- * Returns the absolute path and UUID if found; null otherwise.
+ * Find an existing tunnel by name using `cloudflared tunnel list --output json`,
+ * then verify the credentials file at `<UUID>.json` exists in cloudflared home.
+ *
+ * v0.3.1 replaces the v0.3.0 approach of scanning credentials JSON files for a
+ * `TunnelName` field — that field doesn't exist in real cloudflared credentials
+ * (which only contain TunnelID, TunnelSecret, AccountTag, Endpoint). The old
+ * approach broke idempotency for every real user.
+ *
+ * Returns the credentials path + UUID if found and the file exists; null otherwise.
  */
-async function scanCloudflaredHomeForUuid(
+async function findExistingTunnelByName(
   name: string,
   cloudflaredHome: string,
-  readFileUtf8: (p: string) => Promise<string>,
+  binaryPath: string,
+  spawnImpl: SetupTunnelDeps['spawnImpl'],
   fileExists: (p: string) => boolean,
-  readdirImpl?: (dir: string) => Promise<string[]>,
 ): Promise<{ uuid: string; credentialsFilePath: string } | null> {
-  let entries: string[];
+  const result = await runCommand(spawnImpl, binaryPath, ['tunnel', 'list', '--output', 'json']);
+  if (result.code !== 0) return null;
+
+  let parsed: unknown;
   try {
-    if (readdirImpl) {
-      entries = await readdirImpl(cloudflaredHome);
-    } else {
-      const { readdir } = await import('node:fs/promises');
-      entries = await readdir(cloudflaredHome);
-    }
+    parsed = JSON.parse(result.stdout);
   } catch {
     return null;
   }
+  if (!Array.isArray(parsed)) return null;
 
-  for (const entry of entries) {
-    if (!entry.endsWith('.json')) continue;
-    if (!UUID_RE.test(entry.replace(/\.json$/, ''))) continue;
-    const fullPath = join(cloudflaredHome, entry);
-    if (!fileExists(fullPath)) continue;
-    try {
-      const raw = await readFileUtf8(fullPath);
-      const parsed = JSON.parse(raw) as Partial<CloudflaredCredentialFile>;
-      if (parsed.TunnelName === name) {
-        const uuidFromFilename = entry.replace(/\.json$/, '');
-        const uuid = parsed.TunnelID ?? uuidFromFilename;
-        if (typeof uuid !== 'string') continue;
-        return { uuid, credentialsFilePath: fullPath };
-      }
-    } catch {
-      // malformed JSON in that file — skip
-    }
+  for (const entry of parsed) {
+    if (!entry || typeof entry !== 'object') continue;
+    const obj = entry as Record<string, unknown>;
+    if (obj['name'] !== name) continue;
+    const id = obj['id'];
+    if (typeof id !== 'string' || !UUID_RE.test(id)) continue;
+
+    const credentialsFilePath = join(cloudflaredHome, `${id}.json`);
+    if (!fileExists(credentialsFilePath)) return null;
+    return { uuid: id, credentialsFilePath };
   }
   return null;
 }
@@ -337,12 +336,14 @@ export async function runSetupTunnel(
     }
   } else if (/already exists/i.test(createResult.stderr)) {
     // ── Step 4b: Idempotency — tunnel already exists ────────────────────────
-    const found = await scanCloudflaredHomeForUuid(
+    // v0.3.1 fix: use `cloudflared tunnel list --output json` (not JSON file scan
+     // by TunnelName field — that field doesn't exist in real credentials JSONs).
+    const found = await findExistingTunnelByName(
       name,
       cloudflaredHome,
-      readFileUtf8,
+      binaryPath,
+      spawnImpl,
       fileExists,
-      readdirImpl,
     );
     if (!found) {
       return {

@@ -1952,45 +1952,61 @@ describe('handleStart — FIX-3: validates credentials JSON shape before spawn',
 
       expect(code).toBe(1);
       expect(createTunnel).not.toHaveBeenCalled();
-      // JD R2 fix: missing fields gets its own distinct message
-      expect(stderrLines.join(' ')).toMatch(/missing required fields/i);
+      // v0.3.1 fix: only TunnelID is required (cloudflared writes no TunnelName)
+      expect(stderrLines.join(' ')).toMatch(/missing required field 'TunnelID'/i);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
   });
 
-  it('JD-R2 RED: exits 1 when credentials JSON is missing TunnelName (symmetric to TunnelID)', async () => {
+  it('v0.3.1 fix: REAL cloudflared credentials JSON (TunnelID + TunnelSecret + AccountTag + Endpoint, NO TunnelName) is ACCEPTED', async () => {
+    // The cloudflared CLI writes credentials JSON without a TunnelName field.
+    // v0.3.0 wrongly required TunnelName, breaking every real install.
+    // v0.3.1 only requires TunnelID — TunnelName never existed in the file.
     const { handleStart } = await import('./cli.js');
     const { writeFile, mkdtemp, rm } = await import('node:fs/promises');
     const { tmpdir } = await import('node:os');
     const { join: pj } = await import('node:path');
 
-    const dir = await mkdtemp(pj(tmpdir(), 'jdr2-test-'));
+    const dir = await mkdtemp(pj(tmpdir(), 'v031-fix-'));
     const credFile = pj(dir, 'creds.json');
     try {
-      // Valid JSON but missing TunnelName (TunnelID present)
-      await writeFile(credFile, JSON.stringify({ TunnelID: 'abc-123', AccountTag: 'xyz' }), 'utf8');
+      // EXACT shape that cloudflared 2024.12.x writes (no TunnelName)
+      await writeFile(
+        credFile,
+        JSON.stringify({
+          AccountTag: '153b0a94671781d7398494b39be8c357',
+          TunnelSecret: 'VEOgopowNtWmEaeEHG+300cedM3MaqZcBgPq0rVqn8g=',
+          TunnelID: '89147c18-9198-4599-b7ad-86527377041b',
+          Endpoint: '',
+        }),
+        'utf8',
+      );
 
-      const createTunnel = vi.fn();
+      const createTunnel = vi.fn().mockResolvedValue({
+        publicUrl: 'https://shots.example.com',
+        stop: vi.fn().mockResolvedValue(undefined),
+        onUrlReady: vi.fn().mockReturnValue(() => {}),
+        onDrop: vi.fn().mockReturnValue(() => {}),
+      });
       const deps = buildFakeDeps({
         ensureConfig: vi.fn().mockResolvedValue(buildConfigWithCreds(credFile)),
         createTunnel,
       });
 
-      const stderrLines: string[] = [];
       const code = await handleStart(
         ['start'],
         deps,
         {
           stdout: () => {},
-          stderr: (s) => stderrLines.push(s),
+          stderr: () => {},
+          abortAfterReady: true,
           fileExists: () => true,
         },
       );
 
-      expect(code).toBe(1);
-      expect(createTunnel).not.toHaveBeenCalled();
-      expect(stderrLines.join(' ')).toMatch(/missing required fields/i);
+      expect(code).toBe(0);
+      expect(createTunnel).toHaveBeenCalled();
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

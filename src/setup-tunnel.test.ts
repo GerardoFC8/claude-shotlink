@@ -265,41 +265,36 @@ describe('runSetupTunnel — TASK-012: create-failed branch', () => {
 // ── TASK-013: idempotency — tunnel already exists ────────────────────────────
 
 describe('runSetupTunnel — TASK-013: idempotency (already exists)', () => {
-  it('TASK-013-a RED: reuses UUID when tunnel already exists and creds file found via scan', async () => {
+  it('TASK-013-a RED: reuses UUID when tunnel already exists (v0.3.1: via cloudflared tunnel list)', async () => {
     const { runSetupTunnel } = await import('./setup-tunnel.js');
 
-    const credFile = '/fake/.cloudflared/aabbccdd-1111-2222-3333-444444444444.json';
-    const credFileContents = JSON.stringify({
-      TunnelID: 'aabbccdd-1111-2222-3333-444444444444',
-      TunnelName: 'my-tunnel',
-    });
+    const uuid = 'aabbccdd-1111-2222-3333-444444444444';
+    const credFile = `/fake/.cloudflared/${uuid}.json`;
 
     const createChild = makeFakeChild();
+    const listChild = makeFakeChild();
     const dnsChild = makeFakeChild();
-    const spawnImpl = makeSequentialSpawn(createChild, dnsChild);
+    const spawnImpl = makeSequentialSpawn(createChild, listChild, dnsChild);
 
-    // fileExists: cert.pem present; credential file present
+    // fileExists: cert.pem present; credential file by UUID present
     const fileExists = vi.fn().mockImplementation((p: string) => {
       return p.endsWith('cert.pem') || p === credFile;
     });
 
-    // readFileUtf8: returns the credential file contents when asked
-    const readFileUtf8 = vi.fn().mockImplementation(async (p: string) => {
-      if (p === credFile) return credFileContents;
-      throw new Error(`unexpected readFileUtf8 call: ${p}`);
-    });
-
-    // Inject readdirImpl so no dynamic import needed
-    const readdirImpl = vi.fn().mockResolvedValue(['aabbccdd-1111-2222-3333-444444444444.json']);
-
     const saveConfig = vi.fn().mockResolvedValue(undefined);
-    const deps = makeDeps({ spawnImpl, fileExists, readFileUtf8, readdirImpl, saveConfig });
+    const deps = makeDeps({ spawnImpl, fileExists, saveConfig });
 
     const resultPromise = runSetupTunnel(makeInput(), deps);
 
     // Drive create to fail with "already exists"
     await new Promise<void>((r) => setTimeout(r, 10));
     createChild._endAndExit(1, '', 'Error: tunnel with name my-tunnel already exists');
+
+    // Drive list to return the matching tunnel
+    await new Promise<void>((r) => setTimeout(r, 10));
+    listChild._endAndExit(0, JSON.stringify([
+      { id: uuid, name: 'my-tunnel', created_at: '2026-01-01T00:00:00Z' },
+    ]));
 
     // Drive dns to succeed
     await new Promise<void>((r) => setTimeout(r, 10));
@@ -309,7 +304,7 @@ describe('runSetupTunnel — TASK-013: idempotency (already exists)', () => {
 
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.uuid).toBe('aabbccdd-1111-2222-3333-444444444444');
+      expect(result.uuid).toBe(uuid);
       expect(result.credentialsFile).toBe(credFile);
     }
     expect(saveConfig).toHaveBeenCalledTimes(1);
@@ -319,21 +314,26 @@ describe('runSetupTunnel — TASK-013: idempotency (already exists)', () => {
     const { runSetupTunnel } = await import('./setup-tunnel.js');
 
     const createChild = makeFakeChild();
-    const spawnImpl = vi.fn().mockReturnValue(createChild) as unknown as SetupTunnelDeps['spawnImpl'];
+    const listChild = makeFakeChild();
+    const spawnImpl = makeSequentialSpawn(createChild, listChild);
 
     // cert.pem present, but no uuid.json files found
     const fileExists = vi.fn().mockImplementation((p: string) => p.endsWith('cert.pem'));
 
-    // Inject readdirImpl returning empty list
-    const readdirImpl = vi.fn().mockResolvedValue([]);
-
     const saveConfig = vi.fn();
-    const deps = makeDeps({ spawnImpl, fileExists, readdirImpl, saveConfig });
+    const deps = makeDeps({ spawnImpl, fileExists, saveConfig });
 
     const resultPromise = runSetupTunnel(makeInput(), deps);
 
     await new Promise<void>((r) => setTimeout(r, 10));
     createChild._endAndExit(1, '', 'Error: tunnel with name my-tunnel already exists');
+
+    // v0.3.1 fix: idempotency now uses `cloudflared tunnel list --output json`
+    // List returns the tunnel BUT the credentials file at `<UUID>.json` is absent.
+    await new Promise<void>((r) => setTimeout(r, 10));
+    listChild._endAndExit(0, JSON.stringify([
+      { id: 'aabbccdd-1111-2222-3333-444444444444', name: 'my-tunnel' },
+    ]));
 
     const result = await resultPromise;
 
@@ -343,6 +343,57 @@ describe('runSetupTunnel — TASK-013: idempotency (already exists)', () => {
       expect(result.message).toContain('cloudflared tunnel delete');
     }
     expect(saveConfig).not.toHaveBeenCalled();
+  });
+
+  it('v0.3.1 fix: idempotency uses `cloudflared tunnel list --output json` to find UUID by name (real cloudflared shape — no TunnelName in credentials JSON)', async () => {
+    // The credentials JSON written by cloudflared contains TunnelID + TunnelSecret +
+    // AccountTag + Endpoint, but NO TunnelName. v0.3.0 wrongly scanned files for a
+    // TunnelName field that never existed → idempotency was broken in production.
+    // v0.3.1 uses `cloudflared tunnel list --output json` to map name → UUID, then
+    // verifies <UUID>.json exists in cloudflared home.
+    const { runSetupTunnel } = await import('./setup-tunnel.js');
+
+    const createChild = makeFakeChild();
+    const listChild = makeFakeChild();
+    const dnsChild = makeFakeChild();
+    const spawnImpl = makeSequentialSpawn(createChild, listChild, dnsChild);
+
+    const expectedUuid = '89147c18-9198-4599-b7ad-86527377041b';
+    const expectedCredsPath = `/fake/.cloudflared/${expectedUuid}.json`;
+
+    // cert.pem present + the credentials file by UUID present
+    const fileExists = vi.fn().mockImplementation((p: string) =>
+      p.endsWith('cert.pem') || p === expectedCredsPath
+    );
+
+    const saveConfig = vi.fn();
+    const deps = makeDeps({ spawnImpl, fileExists, saveConfig });
+
+    const resultPromise = runSetupTunnel(makeInput(), deps);
+
+    // 1) tunnel create exits with "already exists"
+    await new Promise<void>((r) => setTimeout(r, 10));
+    createChild._endAndExit(1, '', 'tunnel with name my-tunnel already exists');
+
+    // 2) tunnel list --output json returns the tunnel
+    await new Promise<void>((r) => setTimeout(r, 10));
+    listChild._endAndExit(0, JSON.stringify([
+      { id: expectedUuid, name: 'my-tunnel', created_at: '2026-01-01T00:00:00Z' },
+      { id: 'other-uuid-aaaa-bbbb-cccc-dddddddddddd', name: 'other-tunnel' },
+    ]));
+
+    // 3) tunnel route dns succeeds
+    await new Promise<void>((r) => setTimeout(r, 10));
+    dnsChild._endAndExit(0);
+
+    const result = await resultPromise;
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.uuid).toBe(expectedUuid);
+      expect(result.credentialsFile).toBe(expectedCredsPath);
+    }
+    expect(saveConfig).toHaveBeenCalled();
   });
 });
 
@@ -509,28 +560,21 @@ describe('runSetupTunnel — TASK-015: config write', () => {
     expect(saved.createdAt).toBe(existingConfig.createdAt);
   });
 
-  it('TASK-015-a RED: idempotent re-run merges without duplicate keys', async () => {
+  it('TASK-015-a RED: idempotent re-run merges without duplicate keys (v0.3.1: via cloudflared tunnel list)', async () => {
     const { runSetupTunnel } = await import('./setup-tunnel.js');
 
-    // Second run: create returns "already exists", scan finds credentials
-    const credFile = '/fake/.cloudflared/c0ffee01-1111-2222-3333-444444444444.json';
-    const credFileContents = JSON.stringify({
-      TunnelID: 'c0ffee01-1111-2222-3333-444444444444',
-      TunnelName: 'my-tunnel',
-    });
+    // Second run: create returns "already exists", list returns the tunnel
+    const uuid = 'c0ffee01-1111-2222-3333-444444444444';
+    const credFile = `/fake/.cloudflared/${uuid}.json`;
 
     const createChild = makeFakeChild();
+    const listChild = makeFakeChild();
     const dnsChild = makeFakeChild();
-    const spawnImpl = makeSequentialSpawn(createChild, dnsChild);
+    const spawnImpl = makeSequentialSpawn(createChild, listChild, dnsChild);
 
     const fileExists = vi.fn().mockImplementation((p: string) => {
       return p.endsWith('cert.pem') || p === credFile;
     });
-    const readFileUtf8 = vi.fn().mockImplementation(async (p: string) => {
-      if (p === credFile) return credFileContents;
-      throw new Error(`unexpected: ${p}`);
-    });
-    const readdirImpl = vi.fn().mockResolvedValue(['c0ffee01-1111-2222-3333-444444444444.json']);
 
     // Existing config already has wizard fields from first run
     const existingConfig: Config = {
@@ -548,11 +592,14 @@ describe('runSetupTunnel — TASK-015: config write', () => {
     });
     const ensureConfig = vi.fn().mockResolvedValue(existingConfig);
 
-    const deps = makeDeps({ spawnImpl, fileExists, readFileUtf8, readdirImpl, saveConfig, ensureConfig });
+    const deps = makeDeps({ spawnImpl, fileExists, saveConfig, ensureConfig });
     const resultPromise = runSetupTunnel(makeInput(), deps);
 
     await new Promise<void>((r) => setTimeout(r, 10));
     createChild._endAndExit(1, '', 'Error: tunnel with name my-tunnel already exists');
+
+    await new Promise<void>((r) => setTimeout(r, 10));
+    listChild._endAndExit(0, JSON.stringify([{ id: uuid, name: 'my-tunnel' }]));
 
     await new Promise<void>((r) => setTimeout(r, 10));
     dnsChild._endAndExit(0);

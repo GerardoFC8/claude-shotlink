@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _None yet._
 
+## [0.3.1] — 2026-04-25
+
+### Fixed
+
+Two bugs in v0.3.0 that broke the entire named-mode flow because of a wrong
+assumption about cloudflared's credentials JSON shape. Discovered by the
+maintainer while testing v0.3.0 against a real Cloudflare tunnel (`shots.gfcode.dev`).
+
+- **`handleStart` credentials JSON validation accepts real cloudflared shape**:
+  v0.3.0 required `TunnelID` AND `TunnelName` in the credentials JSON, but
+  cloudflared 2024.12.x writes only `{ AccountTag, TunnelSecret, TunnelID, Endpoint }` —
+  there is no `TunnelName` field. Every real install was rejected with a misleading
+  "missing required fields (TunnelID and TunnelName)" error. v0.3.1 only requires
+  `TunnelID`, which IS present.
+
+- **`setup-tunnel` idempotency uses `cloudflared tunnel list`**:
+  v0.3.0 detected "tunnel already exists" but couldn't find the local credentials,
+  because it scanned `~/.cloudflared/*.json` for a `TunnelName` field that doesn't
+  exist. v0.3.1 spawns `cloudflared tunnel list --output json` to map name → UUID,
+  then verifies `<UUID>.json` exists in cloudflared home. Both unit tests and the
+  integration smoke test now use the REAL cloudflared shape (no `TunnelName`).
+
+Same bug class as the v0.2.2 `--no-autoupdate` arg-position fix: unit tests
+asserted what we coded, not what cloudflared actually produces.
+
 ## [0.3.0] — 2026-04-25
 
 ### Added
