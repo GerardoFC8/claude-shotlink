@@ -104,6 +104,54 @@ describe('handleUnknownCommand', () => {
   });
 });
 
+// ── --version flag ────────────────────────────────────────────────────────────
+
+describe('--version flag', () => {
+  // Read expected version from package.json at test time
+  async function readPkgVersion(): Promise<string> {
+    const { readFile } = await import('node:fs/promises');
+    const pkgPath = join(PROJECT_ROOT, 'package.json');
+    const raw = await readFile(pkgPath, 'utf8');
+    return (JSON.parse(raw) as { version: string }).version;
+  }
+
+  it('--version prints the package version and exits 0', async () => {
+    const { dispatch } = await import('./cli.js');
+    const deps = buildFakeDeps();
+    const stdoutLines: string[] = [];
+    const code = await dispatch(['--version'], deps, {
+      stdout: (s) => stdoutLines.push(s),
+    });
+    const expected = await readPkgVersion();
+    expect(code).toBe(0);
+    expect(stdoutLines.join('').trim()).toBe(expected);
+  });
+
+  it('-v short flag also prints the version', async () => {
+    const { dispatch } = await import('./cli.js');
+    const deps = buildFakeDeps();
+    const stdoutLines: string[] = [];
+    const code = await dispatch(['-v'], deps, {
+      stdout: (s) => stdoutLines.push(s),
+    });
+    const expected = await readPkgVersion();
+    expect(code).toBe(0);
+    expect(stdoutLines.join('').trim()).toBe(expected);
+  });
+
+  it('version subcommand also prints the version', async () => {
+    const { dispatch } = await import('./cli.js');
+    const deps = buildFakeDeps();
+    const stdoutLines: string[] = [];
+    const code = await dispatch(['version'], deps, {
+      stdout: (s) => stdoutLines.push(s),
+    });
+    const expected = await readPkgVersion();
+    expect(code).toBe(0);
+    expect(stdoutLines.join('').trim()).toBe(expected);
+  });
+});
+
 // ── handleStatus ──────────────────────────────────────────────────────────────
 
 describe('handleStatus', () => {

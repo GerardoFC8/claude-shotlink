@@ -192,6 +192,23 @@ export interface CliIO {
 
 // ── defaultDeps ───────────────────────────────────────────────────────────────
 
+/** Read package.json version. Falls back to 'unknown' if neither path resolves. */
+function resolveVersion(): string {
+  const _require = createRequire(import.meta.url);
+  try {
+    const pkg = _require('@gerardofc/claude-shotlink/package.json') as { version: string };
+    return pkg.version;
+  } catch {
+    try {
+      const __filename = fileURLToPath(import.meta.url);
+      const pkg = _require(join(dirname(__filename), '..', 'package.json')) as { version: string };
+      return pkg.version;
+    } catch {
+      return 'unknown';
+    }
+  }
+}
+
 /** Resolve absolute path to dist/hook.js from this module's location */
 function resolveHookPath(): string {
   try {
@@ -253,6 +270,12 @@ export async function dispatch(
 
   const cmd = argv[0] ?? 'start';
 
+  // Short-circuit: --version / -v / version
+  if (cmd === '--version' || cmd === '-v' || cmd === 'version') {
+    out(resolveVersion());
+    return 0;
+  }
+
   switch (cmd) {
     case 'start':
       return handleStart(argv, deps, io);
@@ -280,7 +303,7 @@ export async function dispatch(
 
     default:
       err(`Unknown command: ${cmd}`);
-      err('Usage: claude-shotlink <start|stop|status|install-hook|uninstall-hook|rotate-key|logs|configure-tunnel>');
+      err('Usage: claude-shotlink <start|stop|status|install-hook|uninstall-hook|rotate-key|logs|configure-tunnel> [--version]');
       return 1;
   }
 }
