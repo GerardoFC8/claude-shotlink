@@ -1,6 +1,6 @@
 {
   "name": "@gerardofc/claude-shotlink",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Auto-upload Claude Code screenshots to a temporary public URL so you can review them from any device via Remote Control.",
   "license": "MIT",
   "author": "Gerardo Franco <gerardofranco366@gmail.com>",

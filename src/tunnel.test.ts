@@ -462,7 +462,10 @@ describe('createTunnel — TASK-005: named variant accepted in TunnelOptions', (
 // ── B2: TASK-006-a RED — named-mode argv construction ──────────────────────────
 
 describe('createTunnel — TASK-006: named-mode spawn args', () => {
-  it('spawns with ["tunnel","run","--no-autoupdate","<name>"] in named mode', async () => {
+  it('spawns with ["tunnel","--no-autoupdate","run","<name>"] in named mode', async () => {
+    // cloudflared treats --no-autoupdate as a TUNNEL command option, not a
+    // `run` subcommand option — it MUST come before `run`. Asserting the
+    // correct order here catches regressions of the v0.2.1 silent-fail bug.
     const { createTunnel } = await import('./tunnel.js');
 
     const child = makeFakeChild();
@@ -478,7 +481,7 @@ describe('createTunnel — TASK-006: named-mode spawn args', () => {
 
     expect(spawnImpl).toHaveBeenCalledWith(
       '/usr/local/bin/cloudflared',
-      ['tunnel', 'run', '--no-autoupdate', 'shotlink'],
+      ['tunnel', '--no-autoupdate', 'run', 'shotlink'],
       expect.objectContaining({ stdio: ['ignore', 'pipe', 'pipe'] }),
     );
 

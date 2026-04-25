@@ -7,7 +7,7 @@
  * --no-autoupdate`, watches both stdout and stderr via readline for a
  * trycloudflare.com URL, resolves the promise once the URL is captured.
  *
- * Named mode (v0.2): spawns `cloudflared tunnel run --no-autoupdate <name>`,
+ * Named mode (v0.2): spawns `cloudflared tunnel --no-autoupdate run <name>`,
  * resolves after "Registered tunnel connection" log line OR a 2s grace timer,
  * whichever comes first. Public URL is `https://<hostname>` (known upfront).
  *
@@ -293,10 +293,14 @@ function createNamedTunnel(opts: NamedTunnelInternalOpts): Promise<Tunnel> {
   const publicBaseUrl = `https://${hostname}`;
 
   return new Promise<Tunnel>((resolve, reject) => {
+    // NOTE: cloudflared 2024.12.x parses `--no-autoupdate` as a TUNNEL
+    // command option, not a `run` subcommand option. It MUST come before `run`.
+    // Wrong order → "Incorrect Usage: flag provided but not defined: -no-autoupdate"
+    // and cloudflared exits 0 (printing help), which trips our early-exit reject.
     const args = [
       'tunnel',
-      'run',
       '--no-autoupdate',
+      'run',
       name,
     ];
 
